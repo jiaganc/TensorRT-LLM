@@ -689,24 +689,68 @@ class PyTorchModelEngine(ModelEngine):
             logger.info(
                 f"Creating CUDA graph instances for {len(self._cuda_graph_batch_sizes)} batch sizes."
             )
+
+            def get_memory_usage():
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                allocated = torch.cuda.memory_stats(
+                )["allocated_bytes.all.current"]
+                reserved = torch.cuda.memory_stats(
+                )["reserved_bytes.all.current"]
+                free, total = torch.cuda.mem_get_info()
+                used = total - free
+                return allocated, reserved, used
+
+            MB = 1 << 20
+            allocated0, reserved0, used0 = get_memory_usage()
+            logger.info(f"CG Before Allocated: {allocated0 / (MB):.2f} MiB")
+            logger.info(f"CG Before Reserved: {reserved0 / (MB):.2f} MiB")
+            logger.info(f"CG Before Used: {used0 / (MB):.2f} MiB")
             # Reverse the order of the cuda graph batch sizes to make smaller batch size graph could reuse larger batch size graph memory
+            if os.environ.get("TLLM_REVERSE_BATCH_LIST", "0") == "1":
+                reverse = True
+            else:
+                reverse = False
             cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
-                                            reverse=True)
+                                            reverse=reverse)
             for bs in cuda_graph_batch_sizes:
                 if bs > self.batch_size:
                     # skip batch size larger than self.batch_size
                     continue
+
+                allocated1, reserved1, used1 = get_memory_usage()
+                logger.info(
+                    f"Batch {bs} Before Allocated: {allocated1 / (MB):.2f} MiB")
+                logger.info(
+                    f"Batch {bs} Before Reserved: {reserved1 / (MB):.2f} MiB")
+                logger.info(f"Batch {bs} Before Used: {used1 / (MB):.2f} MiB")
+
                 with release_batch(get_cuda_graph_warmup_request(bs)) as batch:
                     if batch is None:
                         # No KV cache space!
                         return
                     logger.info(
-                        f"Run generation only CUDA graph warmup for batch size={bs}"
+                        f"Run generation only CUDA graph capture for batch size={bs}"
                     )
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
                     torch.cuda.synchronize()
+
+                allocated2, reserved2, used2 = get_memory_usage()
+                logger.info(
+                    f"Batch {bs} After Allocated: {allocated2 / (MB):.2f} MiB")
+                logger.info(
+                    f"Batch {bs} After Reserved: {reserved2 / (MB):.2f} MiB")
+                logger.info(f"Batch {bs} After Used: {used2 / (MB):.2f} MiB")
+                logger.info(
+                    f"Batch {bs} Allocated: {allocated2 - allocated1} bytes")
+                logger.info(
+                    f"Batch {bs} Reserved: {reserved2 - reserved1} bytes")
+                logger.info(f"Batch {bs} Used: {used2 - used1} bytes")
 
                 if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
                     with self.no_cuda_graph():
@@ -727,6 +771,14 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.synchronize()
                             gc.collect()
                             torch.cuda.empty_cache()
+
+            allocated3, reserved3, used3 = get_memory_usage()
+            logger.info(f"CG After Allocated: {allocated3 / (MB):.2f} MiB")
+            logger.info(f"CG After Reserved: {reserved3 / (MB):.2f} MiB")
+            logger.info(f"CG After Used: {used3 / (MB):.2f} MiB")
+            logger.info(f"CG Allocated: {allocated3 - allocated0} bytes")
+            logger.info(f"CG Reserved: {reserved3 - reserved0} bytes")
+            logger.info(f"CG Used: {used3 - used0} bytes")
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         enable_paged_context_mla = is_mla(
@@ -2056,10 +2108,12 @@ class PyTorchModelEngine(ModelEngine):
 
             self.iter_counter += 1
 
-            if maybe_graph is None:
-                with MoeLoadBalancerIterContext(moe_load_balancer):
-                    outputs = self._forward_step(inputs, gather_ids,
-                                                 gather_context_logits)
+            skip_cuda_graph = os.environ.get("TLLM_SKIP_CUDA_GRAPH", "0") == "1"
+            if maybe_graph is None or skip_cuda_graph:
+                for _ in range(3):
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                        outputs = self._forward_step(inputs, gather_ids,
+                                                     gather_context_logits)
             else:
                 if maybe_graph.needs_capture():
 

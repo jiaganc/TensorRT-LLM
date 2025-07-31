@@ -90,6 +90,11 @@ class DecodingCUDAGraphRunner:
             "mrope_position_deltas": self.mrope_position_deltas,
         }
 
+        import os
+        dump_path = os.environ.get("TLLM_DUMP_CUDA_GRAPH", None)
+        if dump_path is not None:
+            self._graph.enable_debug_mode()
+
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
@@ -104,6 +109,10 @@ class DecodingCUDAGraphRunner:
         set_piecewise_cuda_graph_flag(True)
         # Mark weak ref here. The output tensor should be freed properly.
         self._output = make_weak_ref(output)
+
+        if dump_path is not None:
+            self._graph.debug_dump(dump_path)
+
         return self._graph.pool()
 
     def needs_capture(self) -> bool:

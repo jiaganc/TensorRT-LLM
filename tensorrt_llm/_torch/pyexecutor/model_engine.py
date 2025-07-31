@@ -2091,8 +2091,14 @@ class PyTorchModelEngine(ModelEngine):
                                           gather_context_logits)
         with self._maybe_pad_batch(scheduled_requests,
                                    kv_cache_manager) as scheduled_requests:
-            maybe_graph = self._maybe_get_cuda_graph(
-                scheduled_requests, spec_config=self.spec_config)
+
+            skip_cuda_graph = os.environ.get("TLLM_SKIP_CUDA_GRAPH", "0") == "1"
+            if skip_cuda_graph:
+                maybe_graph = None
+            else:
+                maybe_graph = self._maybe_get_cuda_graph(
+                    scheduled_requests, spec_config=self.spec_config)
+
             if maybe_graph is not None:
                 attn_metadata = maybe_graph.attn_metadata
                 if self.is_spec_decode:
@@ -2108,12 +2114,10 @@ class PyTorchModelEngine(ModelEngine):
 
             self.iter_counter += 1
 
-            skip_cuda_graph = os.environ.get("TLLM_SKIP_CUDA_GRAPH", "0") == "1"
-            if maybe_graph is None or skip_cuda_graph:
-                for _ in range(3):
-                    with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = self._forward_step(inputs, gather_ids,
-                                                     gather_context_logits)
+            if maybe_graph is None:
+                with MoeLoadBalancerIterContext(moe_load_balancer):
+                    outputs = self._forward_step(inputs, gather_ids,
+                                                 gather_context_logits)
             else:
                 if maybe_graph.needs_capture():
 

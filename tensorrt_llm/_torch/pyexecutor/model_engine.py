@@ -692,10 +692,11 @@ class PyTorchModelEngine(ModelEngine):
 
             def get_memory_usage():
                 torch.cuda.synchronize()
-                gc.collect()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+                for _ in range(3):
+                    gc.collect()
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
                 allocated = torch.cuda.memory_stats(
                 )["allocated_bytes.all.current"]
                 reserved = torch.cuda.memory_stats(

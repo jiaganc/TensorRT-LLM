@@ -79,6 +79,7 @@ class DecodingCUDAGraphRunner:
         self,
         forward_fn: Callable[[Dict[str, Any]], torch.Tensor],
         pool: Optional[Tuple[int, int]] = None,
+        rank: int = 0,
     ) -> Tuple[int, int]:
         self._graph = torch.cuda.CUDAGraph()
         inputs = {
@@ -92,7 +93,7 @@ class DecodingCUDAGraphRunner:
 
         import os
         dump_path = os.environ.get("TLLM_DUMP_CUDA_GRAPH", None)
-        if dump_path is not None:
+        if dump_path is not None and rank == 0:
             self._graph.enable_debug_mode()
 
         # We have to do warm up runs to initialize PyTorch's
@@ -110,7 +111,7 @@ class DecodingCUDAGraphRunner:
         # Mark weak ref here. The output tensor should be freed properly.
         self._output = make_weak_ref(output)
 
-        if dump_path is not None:
+        if dump_path is not None and rank == 0:
             self._graph.debug_dump(dump_path)
 
         return self._graph.pool()

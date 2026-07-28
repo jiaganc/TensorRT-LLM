@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Complete 8K-input/1K-output TEP16 configuration extracted from
+# perf_sweep/perf_sweep.sbatch. Pass the tuned environment with:
+#   --extra-env KIMI_K3_FP8_WEIGHT_READ_KDA=0
+#   --extra-env KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1
+tensor_parallel_size: 16
+enable_attention_dp: false
+moe_expert_parallel_size: 16
+max_batch_size: 16
+max_num_tokens: 8208
+max_seq_len: 9344
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  max_batch_size: 16
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+stream_interval: 10

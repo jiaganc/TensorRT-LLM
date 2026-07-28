@@ -22,10 +22,11 @@
 # capacity settings compatible with the requested input/output lengths.
 #
 # Optional arguments: --repo PATH, --isl N (default 8192), --osl N (default
-# 1024), and --concurrencies "64 256". --repo defaults to REPO or the submit
-# directory and must contain a built TensorRT-LLM checkout. The job creates
-# one named container per node from --image and installs the checkout editable
-# in each container.
+# 1024), --concurrencies "64 256", and repeatable --extra-env NAME=VALUE.
+# Extra variables are exported only for the server. --repo defaults to REPO
+# or the submit directory and must contain a built TensorRT-LLM checkout. The
+# job creates one named container per node from --image and installs the
+# checkout editable in each container.
 #
 # Results and server/client logs go to kimi-k3-serving-benchmark-<job-id>/
 # in the submission directory.
@@ -48,7 +49,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --image FILE --config FILE [--repo PATH] [--isl N] [--osl N] [--concurrencies \"64 256\"]"
+    echo "Usage: sbatch $0 --image FILE --config FILE [--repo PATH] [--isl N] [--osl N] [--concurrencies \"64 256\"] [--extra-env NAME=VALUE]..."
 }
 
 MODEL_DIR="/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf"
@@ -56,6 +57,7 @@ MODEL="$MODEL_DIR/hf-9f62e4e_orig"
 CONTAINER_IMAGE=""
 CONFIG_FILE=""
 REPO_ARG=""
+EXTRA_ENV=()
 ISL=8192
 OSL=1024
 CONCURRENCIES="64 256"
@@ -92,6 +94,11 @@ while [[ $# -gt 0 ]]; do
             CONCURRENCIES=$2
             shift 2
             ;;
+        --extra-env)
+            [[ $# -ge 2 ]] || { echo "error: --extra-env requires NAME=VALUE" >&2; usage >&2; exit 2; }
+            EXTRA_ENV+=("$2")
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -112,6 +119,13 @@ done
 [[ "$ISL" =~ ^[0-9]+$ && "$OSL" =~ ^[0-9]+$ ]] || { echo "error: --isl/--osl must be integers" >&2; exit 2; }
 for concurrency in $CONCURRENCIES; do
     [[ "$concurrency" =~ ^[0-9]+$ ]] || { echo "error: bad concurrency: $concurrency" >&2; exit 2; }
+done
+for assignment in "${EXTRA_ENV[@]}"; do
+    name=${assignment%%=*}
+    [[ "$assignment" == *=* && "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+        echo "error: --extra-env requires a valid NAME=VALUE: $assignment" >&2
+        exit 2
+    }
 done
 
 REPO=${REPO_ARG:-${REPO:-$SLURM_SUBMIT_DIR}}
@@ -162,6 +176,10 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
     --container-workdir="$REPO" \
     --output="$WORK_DIR/serve.log" \
     bash -c "
+        for assignment in \"\$@\"; do
+            export \"\$assignment\"
+        done
+
         set -x
         ulimit -n 65536
 
@@ -185,7 +203,7 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
             --host 0.0.0.0 \
             --port $PORT \
             --config '$CONFIG_FILE'
-    " &
+    " bash "${EXTRA_ENV[@]}" &
 SERVER_PID=$!
 
 # Wait up to 25 min for health; on timeout or server death, cancel the job

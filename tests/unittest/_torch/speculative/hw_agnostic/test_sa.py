@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -441,7 +442,7 @@ class TestSADisaggGenInit:
 
 
 class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
-    """seed_kda_replay_caches_for_disagg_gen must mirror
+    """The Kimi V2 manager must mirror
     _sync_kda_replay_conv_window for transferred requests: committed conv
     window seeded from the (transferred) conv pool, draft tail columns and
     pending-draft scratch cleared, other slots untouched."""
@@ -449,10 +450,9 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
     L, SLOTS, D, W, M, NHEADS = 2, 4, 6, 4, 2, 3  # committed = W - 1 = 3
 
     def _make_manager(self, use_kda_replay=True):
-        from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-            PythonMambaCacheManager
-        L, SLOTS, D, W, M, NH = (self.L, self.SLOTS, self.D, self.W, self.M,
-                                 self.NHEADS)
+        from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiKDAHybridCacheManagerV2
+
+        L, SLOTS, D, W, M, NH = (self.L, self.SLOTS, self.D, self.W, self.M, self.NHEADS)
         committed = W - 1
 
         class _FakeSpecState:
@@ -467,15 +467,21 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
         cache.kda_qkg_cache = torch.full((L, SLOTS, M, 3, D), 7.0)
         cache.kda_v_cache = torch.full((L, SLOTS, M, D), 7.0)
         cache.kda_beta_cache = torch.full((L, SLOTS, M, NH), 7.0)
-        cache.prev_num_accepted_tokens = torch.full((SLOTS, ),
-                                                    5,
-                                                    dtype=torch.int32)
+        cache.prev_num_accepted_tokens = torch.full((SLOTS,), 5, dtype=torch.int32)
 
-        mgr = PythonMambaCacheManager.__new__(PythonMambaCacheManager)
-        mgr._use_kda_replay_update = use_kda_replay
-        mgr.SpeculativeState = _FakeSpecState
-        mgr.mamba_cache = cache
-        mgr.mamba_cache_index = {101: 1, 202: 3}
+        mgr = KimiKDAHybridCacheManagerV2.__new__(KimiKDAHybridCacheManagerV2)
+        mgr._kda_replay_num_spec = M if use_kda_replay else None
+        mgr._request_id_to_state_index = {101: 1, 202: 3}
+        mgr.all_conv_states = [cache.conv[layer] for layer in range(L)]
+        mgr.conv_section_dims = [D, D, D]
+        mgr.conv_state_shape = [3 * D, W]
+        mgr.kda_conv_q = cache.kda_conv_q
+        mgr.kda_conv_k = cache.kda_conv_k
+        mgr.kda_conv_v = cache.kda_conv_v
+        mgr.kda_qkg_cache = cache.kda_qkg_cache
+        mgr.kda_v_cache = cache.kda_v_cache
+        mgr.kda_beta_cache = cache.kda_beta_cache
+        mgr.prev_num_accepted_tokens = cache.prev_num_accepted_tokens
         return mgr, cache
 
     def test_seeds_committed_window_and_clears_scratch(self):
@@ -485,12 +491,14 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
         mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
         d = self.D
         for slot in (1, 3):
-            for kda, lo, hi in ((cache.kda_conv_q, 0, d),
-                                (cache.kda_conv_k, d, 2 * d),
-                                (cache.kda_conv_v, 2 * d, 3 * d)):
+            for kda, lo, hi in (
+                (cache.kda_conv_q, 0, d),
+                (cache.kda_conv_k, d, 2 * d),
+                (cache.kda_conv_v, 2 * d, 3 * d),
+            ):
                 torch.testing.assert_close(
-                    kda[:, slot, :, :committed],
-                    conv_before[:, slot, lo:hi, 1:].to(kda.dtype))
+                    kda[:, slot, :, :committed], conv_before[:, slot, lo:hi, 1:].to(kda.dtype)
+                )
                 assert (kda[:, slot, :, committed:] == 0).all()
             assert (cache.kda_qkg_cache[:, slot] == 0).all()
             assert (cache.kda_v_cache[:, slot] == 0).all()
@@ -512,6 +520,38 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
         mgr2, cache2 = self._make_manager()
         mgr2.seed_kda_replay_caches_for_disagg_gen([999])  # not in index
         assert (cache2.kda_conv_q == 7.0).all()
+
+    def test_records_accepted_drafts_and_skips_dummy_rows(self):
+        mgr, cache = self._make_manager()
+        mgr.local_num_mamba_layers = self.L
+        mgr._dummy_request_mask = torch.tensor([False, True])
+        state_indices = torch.tensor([0, 1, 3], dtype=torch.int32)
+
+        mgr.update_mamba_states(
+            SimpleNamespace(num_seqs=3, num_contexts=1),
+            torch.tensor([1, 3, 4], dtype=torch.int32),
+            state_indices,
+        )
+
+        assert cache.prev_num_accepted_tokens.tolist() == [5, 2, 5, 5]
+
+    def test_layer_cache_exposes_kda_replay_state(self):
+        mgr, cache = self._make_manager()
+        mgr.mamba_layer_offsets = {7: 1}
+        mgr.all_ssm_states = [
+            torch.empty(self.SLOTS, self.NHEADS, 2, 2),
+            torch.empty(self.SLOTS, self.NHEADS, 2, 2),
+        ]
+        mgr.mamba_ssm_rand_seed = None
+
+        layer_cache = mgr.mamba_layer_cache(7)
+
+        assert layer_cache.conv.data_ptr() == cache.conv[1].data_ptr()
+        assert layer_cache.temporal.data_ptr() == mgr.all_ssm_states[1].data_ptr()
+        assert layer_cache.kda_conv_q.data_ptr() == cache.kda_conv_q[1].data_ptr()
+        assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
+            cache.prev_num_accepted_tokens.data_ptr()
+        )
 
 
 if __name__ == "__main__":

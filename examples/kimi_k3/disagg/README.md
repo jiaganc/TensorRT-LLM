@@ -31,9 +31,9 @@ for constraints.
   replicated share ~113 GiB + experts/8), leaving no activation headroom
   on GB300 (288 GiB) and not fitting GB200 (186 GiB). Treat DEP8-ctx as
   ruled out on GB200 and an open (likely negative) question on GB300.
-- **`transceiver_runtime: PYTHON` is mandatory**: `auto` resolves to the
-  C++ transceiver, which throws at construction for K3's
-  `MixedMambaHybridCacheManager`.
+- **`transceiver_runtime: PYTHON` is mandatory** for the validated V2 route.
+  K3 now prefers this runtime when the setting is `auto`; the configs keep it
+  explicit.
 - `disable_overlap_scheduler: true` on the ctx server (disagg
   requirement) and on the gen server (SA runs eager; also keeps the
   SA-off smoke maximally comparable).

@@ -28,8 +28,7 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.25
 cache_transceiver_config:
   backend: NIXL
-  # Mandatory for K3: `auto` resolves to the C++ transceiver, which
-  # throws for K3's MixedMambaHybridCacheManager.
+  # Validated K3 V2 transceiver route (`auto` also resolves to PYTHON).
   transceiver_runtime: PYTHON
   # Must be >= the target max ISL and match the ctx side.
   max_tokens_in_buffer: 8448

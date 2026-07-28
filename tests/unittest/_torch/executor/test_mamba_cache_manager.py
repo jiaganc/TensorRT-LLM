@@ -12,6 +12,7 @@ import torch
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiKDAHybridCacheManagerV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -142,6 +143,22 @@ def _hybrid_model_config():
     )
 
 
+def _kimi_model_config():
+    config = SimpleNamespace(
+        model_type="kimi_linear",
+        linear_attn_config={
+            "kda_layers": [1],
+            "full_attn_layers": [2],
+        },
+        num_hidden_layers=2,
+    )
+    return SimpleNamespace(
+        pretrained_config=config,
+        sparse_attention_config=None,
+        get_num_mamba_layers=lambda: 1,
+    )
+
+
 def _hybrid_cache_sizing_model_config(layer_types):
     config = SimpleNamespace(
         architectures=["Qwen3_5ForCausalLM"],
@@ -213,6 +230,19 @@ def test_hybrid_cache_manager_factory_honors_v2_setting(
     )
 
     assert get_kv_cache_manager_cls(_hybrid_model_config(), kv_cache_config) is expected
+
+
+def test_kimi_kda_uses_specialized_v2_cache_manager(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    manager_cls = get_kv_cache_manager_cls(
+        _kimi_model_config(),
+        KvCacheConfig(use_kv_cache_manager_v2=True),
+    )
+
+    assert manager_cls is KimiKDAHybridCacheManagerV2
+    assert issubclass(manager_cls, MambaHybridCacheManagerV2)
 
 
 def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
@@ -515,6 +545,7 @@ def test_hybrid_cache_manager_factory_keeps_v1_disagg_route(monkeypatch, use_v2)
 
 
 def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
     from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
     from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5VLModel
     from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
@@ -527,7 +558,12 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
     ):
         monkeypatch.delenv(env_var, raising=False)
 
-    for model_cls in (NemotronHForCausalLM, Qwen3NextForCausalLM, Qwen3_5VLModel):
+    for model_cls in (
+        KimiLinearForCausalLM,
+        NemotronHForCausalLM,
+        Qwen3NextForCausalLM,
+        Qwen3_5VLModel,
+    ):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),

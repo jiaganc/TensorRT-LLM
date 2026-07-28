@@ -251,6 +251,10 @@ def get_kv_cache_manager_cls(
                 "V2 Mamba block reuse is not compatible with "
                 "enable_kv_pool_rebalance because the rebalancer does not "
                 "yet model retained recurrent-state snapshots.")
+        if is_kimi_linear(config):
+            from ..modules.kimi_kda.cache_manager import \
+                KimiKDAHybridCacheManagerV2
+            return KimiKDAHybridCacheManagerV2
         return MambaHybridCacheManagerV2
     elif sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
@@ -2003,24 +2007,14 @@ def _create_kv_cache_manager(
         # manager's own internal gate (`tp_size = 1 if enable_attention_dp
         # else tp_size`, then num_heads / n_groups / conv_dim divide by
         # it), so the params pass through unscaled.
-        # KDA fused multi-token verify (trtllm::kda_mtp_decode): when the
-        # kernel can run here, allocate the per-slot replay caches instead
-        # of the legacy per-step intermediate verification buffers. The
-        # kernel replays accepted drafts from these caches and commits
-        # states in place, replacing the intermediate-buffer + promotion
-        # flow for KDA layers.
+        # KimiKDAHybridCacheManagerV2 allocates per-slot replay caches when
+        # trtllm::kda_mtp_decode is available. Explicit V1 fallback uses the
+        # generic per-step intermediate verification buffers.
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
             mamba_manager_extra_kwargs["conv_state_layout"] = "q_k_v"
         else:
             mamba_manager_extra_kwargs["model_type"] = "qwen3_next"
-        if spec_config is not None and issubclass(kv_cache_manager_cls,
-                                                  MixedMambaHybridCacheManager):
-            from ..modules.kimi_kda._kda_kernels import \
-                is_kda_mtp_verify_available
-            if is_kda_mtp_verify_available():
-                mamba_manager_extra_kwargs["kda_replay_num_spec"] = (
-                    spec_config.tokens_per_gen_step - 1)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,

@@ -186,8 +186,8 @@ sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
     --model MODEL --image IMAGE --reuse
 ```
 
-Block reuse stays off by default because suffix-automaton speculative
-decoding requires the default cache manager, which cannot reuse blocks.
+Block reuse stays off by default because recurrent-state reuse requires an
+explicit KDA snapshot policy.
 
 ## Current limitations
 

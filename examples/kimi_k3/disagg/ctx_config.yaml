@@ -38,9 +38,7 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.25
 cache_transceiver_config:
   backend: NIXL
-  # K3 requires the Python V2 transceiver: `auto` resolves to the C++
-  # runtime, which throws at construction for K3's
-  # MixedMambaHybridCacheManager (LinearAttentionMetadata not found).
+  # Validated K3 V2 transceiver route (`auto` also resolves to PYTHON).
   transceiver_runtime: PYTHON
   # Must be >= the target max ISL (8192 here).
   max_tokens_in_buffer: 8448

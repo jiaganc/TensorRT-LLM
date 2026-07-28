@@ -4,22 +4,29 @@
 #
 # Kimi K3 serving benchmark on 16 NVIDIA Blackwell GPUs.
 #
-# Brings up trtllm-serve with attention DP + 16-way expert parallelism, then
-# drives the in-repo benchmark client (tensorrt_llm/serve/scripts/
-# benchmark_serving.py) with synthetic random 8K-input/1K-output requests.
+# Brings up trtllm-serve, then drives the in-repo benchmark client
+# (tensorrt_llm/serve/scripts/benchmark_serving.py) with synthetic random
+# 8K-input/1K-output requests.
 # Per concurrency C: one warmup pass (C requests, discarded), then one
 # measured pass (10*C requests) saved as JSON.
 #
-# Submit from the repository root of a built TensorRT-LLM checkout (see the
-# README Prerequisites section):
+# Submit the job with the container, repository, and configuration paths:
 #
 #   sbatch examples/kimi_k3/run_serving_benchmark_kimi_k3.sbatch \
-#       --model /path/to/kimi-k3-checkpoint \
-#       --image /path/to/tensorrt-llm-container.sqsh
+#       --image /path/to/tensorrt-llm-container.sqsh \
+#       --repo /path/to/TensorRT-LLM \
+#       --config /path/to/TensorRT-LLM/examples/kimi_k3/serving_benchmark_llm_options.yaml
 #
-# Optional arguments: --isl N (default 8192), --osl N (default 1024),
-# --concurrencies "64 256". REPO defaults to the submit directory (override
-# by exporting REPO) and must contain the built TensorRT-LLM checkout.
+# The checkpoint path is fixed to the shared Kimi K3 model below. --config
+# must contain the complete LLM configuration, including parallelism and
+# capacity settings compatible with the requested input/output lengths.
+#
+# Optional arguments: --repo PATH, --isl N (default 8192), --osl N (default
+# 1024), and --concurrencies "64 256". --repo defaults to REPO or the submit
+# directory and must contain a built TensorRT-LLM checkout. The job creates
+# one named container per node from --image and installs the checkout editable
+# in each container.
+#
 # Results and server/client logs go to kimi-k3-serving-benchmark-<job-id>/
 # in the submission directory.
 #
@@ -41,27 +48,49 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --model PATH --image PATH [--isl N] [--osl N] [--concurrencies \"64 256\"]"
+    echo "Usage: sbatch $0 --image FILE --config FILE [--repo PATH] [--isl N] [--osl N] [--concurrencies \"64 256\"]"
 }
 
-MODEL=""
+MODEL_DIR="/scratch/fsw/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/moonshotai_kimi-k3/hf"
+MODEL="$MODEL_DIR/hf-9f62e4e_orig"
 CONTAINER_IMAGE=""
+CONFIG_FILE=""
+REPO_ARG=""
 ISL=8192
 OSL=1024
 CONCURRENCIES="64 256"
 PORT=8000
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model|--image|--isl|--osl|--concurrencies)
-            [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; usage >&2; exit 2; }
-            VALUE=$2
-            OPT=$1
+        --image)
+            [[ $# -ge 2 ]] || { echo "error: --image requires a value" >&2; usage >&2; exit 2; }
+            CONTAINER_IMAGE=$2
             shift 2
             ;;
-        --model=*|--image=*|--isl=*|--osl=*|--concurrencies=*)
-            VALUE=${1#*=}
-            OPT=${1%%=*}
-            shift
+        --config)
+            [[ $# -ge 2 ]] || { echo "error: --config requires a value" >&2; usage >&2; exit 2; }
+            CONFIG_FILE=$2
+            shift 2
+            ;;
+        --repo)
+            [[ $# -ge 2 ]] || { echo "error: --repo requires a value" >&2; usage >&2; exit 2; }
+            REPO_ARG=$2
+            shift 2
+            ;;
+        --isl)
+            [[ $# -ge 2 ]] || { echo "error: --isl requires a value" >&2; usage >&2; exit 2; }
+            ISL=$2
+            shift 2
+            ;;
+        --osl)
+            [[ $# -ge 2 ]] || { echo "error: --osl requires a value" >&2; usage >&2; exit 2; }
+            OSL=$2
+            shift 2
+            ;;
+        --concurrencies)
+            [[ $# -ge 2 ]] || { echo "error: --concurrencies requires a value" >&2; usage >&2; exit 2; }
+            CONCURRENCIES=$2
+            shift 2
             ;;
         -h|--help)
             usage
@@ -73,45 +102,26 @@ while [[ $# -gt 0 ]]; do
             exit 2
             ;;
     esac
-    case "$OPT" in
-        --model) MODEL=$VALUE ;;
-        --image) CONTAINER_IMAGE=$VALUE ;;
-        --isl) ISL=$VALUE ;;
-        --osl) OSL=$VALUE ;;
-        --concurrencies) CONCURRENCIES=$VALUE ;;
-    esac
 done
 
-[[ -n "$MODEL" ]] || { echo "error: --model is required" >&2; usage >&2; exit 2; }
 [[ -n "$CONTAINER_IMAGE" ]] || { echo "error: --image is required" >&2; usage >&2; exit 2; }
+[[ -n "$CONFIG_FILE" ]] || { echo "error: --config is required" >&2; usage >&2; exit 2; }
 [[ -e "$MODEL" ]] || { echo "error: model path does not exist: $MODEL" >&2; exit 2; }
-[[ -e "$CONTAINER_IMAGE" ]] || { echo "error: image path does not exist: $CONTAINER_IMAGE" >&2; exit 2; }
+[[ -f "$CONTAINER_IMAGE" ]] || { echo "error: image file does not exist: $CONTAINER_IMAGE" >&2; exit 2; }
+[[ -f "$CONFIG_FILE" ]] || { echo "error: config file does not exist: $CONFIG_FILE" >&2; exit 2; }
 [[ "$ISL" =~ ^[0-9]+$ && "$OSL" =~ ^[0-9]+$ ]] || { echo "error: --isl/--osl must be integers" >&2; exit 2; }
 for concurrency in $CONCURRENCIES; do
     [[ "$concurrency" =~ ^[0-9]+$ ]] || { echo "error: bad concurrency: $concurrency" >&2; exit 2; }
 done
 
-# 9344 at the default 8192/1024, matching the verified runs exactly.
-MAX_SEQ_LEN=$((ISL + OSL + 128))
+REPO=${REPO_ARG:-${REPO:-$SLURM_SUBMIT_DIR}}
+[[ -d "$REPO" ]] || { echo "error: repo path does not exist: $REPO" >&2; exit 2; }
+REPO=$(realpath "$REPO")
+[[ -f "$REPO/setup.py" ]] || { echo "error: repo path is not a TensorRT-LLM checkout: $REPO" >&2; exit 2; }
+CONFIG_FILE=$(realpath "$CONFIG_FILE")
 
-REPO=${REPO:-$SLURM_SUBMIT_DIR}
 WORK_DIR=$SLURM_SUBMIT_DIR/kimi-k3-serving-benchmark-$SLURM_JOB_ID
 mkdir -p "$WORK_DIR"
-
-# Serving config; free_gpu_memory_fraction 0.25 leaves headroom for the
-# KDA/SSM state cache on top of the model weights.
-CONFIG_FILE=$WORK_DIR/serve_config.yaml
-cat > "$CONFIG_FILE" <<'EOF'
-enable_attention_dp: true
-moe_expert_parallel_size: 16
-disable_overlap_scheduler: false
-cuda_graph_config:
-  max_batch_size: 32
-enable_chunked_prefill: true
-kv_cache_config:
-  enable_block_reuse: false
-  free_gpu_memory_fraction: 0.25
-EOF
 
 # Shared warm caches, persistent across runs: without a pre-populated
 # FLASHINFER_CUBIN_DIR, ranks on egress-less compute nodes can hang fetching
@@ -119,7 +129,25 @@ EOF
 CACHE_DIR=${CACHE_DIR:-$SLURM_SUBMIT_DIR/.kimi_k3_cache}
 mkdir -p "$CACHE_DIR"
 
-MOUNTS="$REPO:$REPO:rw,$MODEL:$MODEL:ro,$WORK_DIR:$WORK_DIR:rw,$CACHE_DIR:$CACHE_DIR:rw"
+MOUNTS="$REPO:$REPO:rw,$MODEL:$MODEL:ro,$CONFIG_FILE:$CONFIG_FILE:ro,$WORK_DIR:$WORK_DIR:rw,$CACHE_DIR:$CACHE_DIR:rw"
+if [ -n "${EXTRA_MOUNTS:-}" ]; then
+    MOUNTS+=",$EXTRA_MOUNTS"
+fi
+
+CONTAINER_NAME="kimi-k3-serving-benchmark-$SLURM_JOB_ID"
+srun --nodes="$SLURM_NNODES" \
+    --ntasks="$SLURM_NNODES" \
+    --ntasks-per-node=1 \
+    --kill-on-bad-exit=1 \
+    --container-image="$CONTAINER_IMAGE" \
+    --container-name="$CONTAINER_NAME" \
+    --container-mounts="$MOUNTS" \
+    --container-workdir="$REPO" \
+    bash -c '
+        set -euo pipefail
+        python3 -m pip install -e "$1"
+    ' bash "$REPO"
+
 HEAD_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | awk 'NR == 1')
 
 SERVER_PID=""
@@ -129,9 +157,9 @@ trap cleanup EXIT
 # Server: all 16 ranks; rank 0 (this node) binds the HTTP endpoint.
 # --kill-on-bad-exit=1: any failed rank kills the whole step immediately.
 srun --mpi=pmix --kill-on-bad-exit=1 \
-    --container-image="$CONTAINER_IMAGE" \
-    --container-mount-home \
+    --container-name="$CONTAINER_NAME" \
     --container-mounts="$MOUNTS" \
+    --container-workdir="$REPO" \
     --output="$WORK_DIR/serve.log" \
     bash -c "
         set -x
@@ -151,19 +179,11 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
         # a caller-side forced communication strategy.
         unset TRTLLM_FORCE_COMM_METHOD
 
-        # In-place venv of the built checkout (build_wheel.py creates .venv-3.12).
-        export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
-
-        exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' trtllm-serve \
+        exec trtllm-llmapi-launch trtllm-serve \
             \"$MODEL\" \
             --backend pytorch \
             --host 0.0.0.0 \
             --port $PORT \
-            --tp_size 16 \
-            --max_batch_size 32 \
-            --max_num_tokens 8192 \
-            --max_seq_len $MAX_SEQ_LEN \
-            --trust_remote_code \
             --config '$CONFIG_FILE'
     " &
 SERVER_PID=$!
@@ -186,13 +206,12 @@ echo "Server is healthy; starting benchmark sweep (see $WORK_DIR/client.log)."
 # generated client-side (--random-ids --tokenize-on-client) so the server
 # sees exactly ISL input tokens; --ignore-eos fixes output length at OSL.
 srun --overlap --kill-on-bad-exit=1 --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
-    --container-image="$CONTAINER_IMAGE" \
-    --container-mount-home \
+    --container-name="$CONTAINER_NAME" \
     --container-mounts="$MOUNTS" \
+    --container-workdir="$REPO" \
     --output="$WORK_DIR/client.log" \
     bash -c "
         set -x
-        export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
 
         run_client() {
             python3 -m tensorrt_llm.serve.scripts.benchmark_serving \

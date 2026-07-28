@@ -437,7 +437,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             cache_mgr.num_kv_heads_per_layer[0],
             self._kv_head_dim_bytes,
             cache_mgr.max_total_draft_tokens,
-            cache_mgr.max_attention_window_vec[0],
+            # Dynamic-tree MTP currently supports full-attention KV layers.
+            # Hybrid managers may store a recurrent-state sentinel first,
+            # while V2 represents full attention as None, so neither form is
+            # suitable for the integer maxKVCacheLen operator argument.
+            cache_mgr.max_seq_len,
             cache_mgr.kv_cache_pool_pointers,
             attn_metadata.kv_cache_block_offsets,
             cache_mgr.max_blocks_per_seq,

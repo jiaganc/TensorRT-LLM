@@ -53,6 +53,7 @@ from ._core import (  # noqa: F401
     ExpandedBuffer,
     KVCacheManager,
     PageIndexConverter,
+    PlannedDropHandle,
     PoolDesc,
     PoolGroupDesc,
     PoolGroupPeakBlockStats,
@@ -77,6 +78,7 @@ from ._stats import (  # noqa: F401
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     KVCacheIterationStatsDelta,
     KVCacheStatsDelta,
+    SsmSnapshotIterationStatsDelta,
 )
 from ._storage import BufferId  # noqa: F401
 from ._storage._config import CoalescedBuffer, SlotDesc, SlotDescVariant  # noqa: F401
@@ -124,6 +126,7 @@ __all__ = [
     "NDEBUG",
     "OutOfPagesError",
     "PageIndexConverter",
+    "PlannedDropHandle",
     "PoolGroupPeakBlockStats",
     "PageIndexMode",
     "PageStatus",
@@ -140,6 +143,7 @@ __all__ = [
     "SlotDesc",
     "SlotDescVariant",
     "SsmLayerConfig",
+    "SsmSnapshotIterationStatsDelta",
     "SwaScratchReuseConfig",
     "TokenId",
     "TokenIdExt",

@@ -106,6 +106,7 @@ from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
+from ..pyexecutor.trace_log_utils import log_mem_snapshot
 from ..utils import ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -2579,14 +2580,19 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         return name_map, expected_keys, expert_jobs
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        log_mem_snapshot("kimi/load_weights/start")
         prefix = "language_model." if any(k.startswith("language_model.") for k in weights) else ""
         params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
 
         self._validate_checkpoint_keys(weights, expected_keys, prefix)
+        log_mem_snapshot("kimi/load_weights/after_checkpoint_validation")
         num_params = self._load_trunk_params(weights, params, name_map)
+        log_mem_snapshot("kimi/load_weights/after_trunk")
         self._load_expert_slices(weights, expert_jobs)
+        log_mem_snapshot("kimi/load_weights/after_experts")
         self._finalize_weight_load(num_params, len(expert_jobs))
+        log_mem_snapshot("kimi/load_weights/after_finalization")
         device = next(self.parameters()).device
         if device.type == "cuda":
             # Lazy source mappings are load-scoped; finish nonblocking H2D
@@ -3024,6 +3030,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             f"slices of {num_moe_layers} MoE layers; fused prefill/decode/verify "
             f"projections on {num_kda_fused} KDA layers"
         )
+        log_mem_snapshot("kimi/load_weights/finalize/after_kda_fusion")
 
         # FP8 block-scale weight read for the replicated MoE-layer MLPs. The
         # DeepGEMM fp8_swap_ab_gemm kernel is Blackwell-only; keep BF16 on any
@@ -3041,6 +3048,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 f"Kimi K3: reading {n_fp8} MoE-layer MLP projections "
                 f"(shared-expert + latent) at FP8 block-scale"
             )
+            log_mem_snapshot("kimi/load_weights/finalize/after_moe_fp8")
             # The KDA q/k/v/g/o projections are the largest single replicated
             # weight read; convert them to the same FP8 block-scale read unless
             # kept in BF16 for accuracy (their own switch — the recurrent core
@@ -3052,6 +3060,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     f"at FP8 block-scale (q/k/v/g fused into one prefill/decode/verify GEMM "
                     f"per layer)"
                 )
+                log_mem_snapshot("kimi/load_weights/finalize/after_kda_fp8")
                 if kda_glue_fp8:
                     # Rebuild the fused projection path on top of the FP8
                     # modules. This must run after the conversion above so
@@ -3066,6 +3075,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         f"Kimi K3: FP8 fused prefill/decode/verify projections on "
                         f"{n_glue} KDA layers"
                     )
+                    log_mem_snapshot("kimi/load_weights/finalize/after_kda_fp8_glue")
             # The MLA q_a/q_b/o and output-gate projections are the remaining
             # replicated attention weight read the MLP and KDA passes above
             # leave in BF16; convert them to the same FP8 block-scale read
@@ -3076,3 +3086,4 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 logger.info(
                     f"Kimi K3: reading {n_mla} MLA q_a/q_b/o/g projections at FP8 block-scale"
                 )
+                log_mem_snapshot("kimi/load_weights/finalize/after_mla_fp8")

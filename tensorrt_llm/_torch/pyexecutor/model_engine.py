@@ -532,6 +532,14 @@ class PyTorchModelEngine(ModelEngine):
             )
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
+            if os.environ.get("TLLM_LOG_MEM_PROFILE_DETAIL", "") == "1":
+                # Diagnostic only: prove whether lazy checkpoint mappings own
+                # the anonymous RSS retained after Kimi weight loading.  All
+                # H2D work must finish before their source mappings are closed.
+                torch.cuda.synchronize()
+                log_mem_snapshot("model_engine/before_checkpoint_cleanup")
+                checkpoint_loader.cleanup()
+                log_mem_snapshot("model_engine/after_checkpoint_cleanup")
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:

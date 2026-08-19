@@ -9,12 +9,17 @@ can import freely without creating circular dependencies.
 """
 
 import os
+import threading
+import time
+from contextlib import contextmanager
+from typing import Iterator
 
 import torch
 
 from tensorrt_llm.logger import logger
 
 _GIB = 1 << 30
+_MIB = 1 << 20
 _PROC_STATUS_MEMORY_FIELDS = {
     "VmHWM": "host_rss_peak",
     "VmRSS": "host_rss",
@@ -37,6 +42,40 @@ def _read_proc_status_memory() -> dict[str, int]:
     except OSError:
         return {}
     return values
+
+
+@contextmanager
+def log_mem_delta(tag: str, *, min_delta_mib: int = 64, **metadata: object) -> Iterator[None]:
+    """Log significant host RSS changes across one diagnostic function call."""
+    enabled = (
+        os.environ.get("TLLM_LOG_MEM_PROFILE", "") == "1"
+        and os.environ.get("TLLM_LOG_MEM_PROFILE_DETAIL", "") == "1"
+    )
+    if not enabled:
+        yield
+        return
+
+    before = _read_proc_status_memory()
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        after = _read_proc_status_memory()
+        keys = ("host_rss", "host_rss_anon", "host_rss_file", "host_rss_shmem")
+        deltas = {key: after.get(key, 0) - before.get(key, 0) for key in keys}
+        if max((abs(delta) for delta in deltas.values()), default=0) >= min_delta_mib * _MIB:
+            extras = "".join(f" {key}={value}" for key, value in metadata.items())
+            logger.info(
+                f"[mem-profile-detail/{tag}] "
+                f"rss_delta={deltas['host_rss'] / _GIB:+.2f}GiB "
+                f"anon_delta={deltas['host_rss_anon'] / _GIB:+.2f}GiB "
+                f"file_delta={deltas['host_rss_file'] / _GIB:+.2f}GiB "
+                f"shmem_delta={deltas['host_rss_shmem'] / _GIB:+.2f}GiB "
+                f"rss={after.get('host_rss', 0) / _GIB:.2f}GiB "
+                f"anon={after.get('host_rss_anon', 0) / _GIB:.2f}GiB "
+                f"elapsed={time.perf_counter() - start:.3f}s "
+                f"thread={threading.get_ident()}{extras}"
+            )
 
 
 def log_mem_snapshot(tag: str) -> None:

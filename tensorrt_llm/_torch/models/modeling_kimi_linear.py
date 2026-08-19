@@ -106,7 +106,7 @@ from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..pyexecutor.trace_log_utils import log_mem_snapshot
+from ..pyexecutor.trace_log_utils import log_mem_delta, log_mem_snapshot
 from ..utils import ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -2674,7 +2674,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 mla_tp_rank = layer.self_attn._mla_tp_rank
                 break
 
-        def load_param(name: str, param: torch.nn.Parameter):
+        def load_param_unprofiled(name: str, param: torch.nn.Parameter):
             if device.type == "cuda":
                 torch.cuda.set_device(device)
             if name.endswith(_GATE_UP_FUSED_SUFFIX):
@@ -2852,6 +2852,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
             param.data.copy_(src.to(param.dtype))
 
+        def load_param(name: str, param: torch.nn.Parameter):
+            param_mib = param.numel() * param.element_size() / (1 << 20)
+            with log_mem_delta(
+                f"kimi/load_trunk/{name}",
+                min_delta_mib=32,
+                param_mib=f"{param_mib:.2f}",
+                param_dtype=param.dtype,
+                param_device=param.device,
+            ):
+                load_param_unprofiled(name, param)
+
         param_jobs = [(name, params[name]) for name in name_map]
         run_concurrently(load_param, param_jobs, num_workers=8)
 
@@ -2944,34 +2955,47 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     pass
 
             def load_expert_file(file_name: str, jobs: list):
-                if device.type == "cuda":
-                    torch.cuda.set_device(device)
-                path = os.path.join(ckpt_dir, file_name)
-                with safe_open(path, framework="pt", device="cpu") as fh:
-                    for moe, base, local_slot_id, expert_idx in jobs:
-                        load_expert(moe, base, local_slot_id, expert_idx, fh.get_tensor)
-                # Handle closed -> pages unmapped -> the drop takes effect.
-                drop_file_pages(file_name)
+                with log_mem_delta(
+                    f"kimi/load_expert_file/{file_name}",
+                    min_delta_mib=32,
+                    num_experts=len(jobs),
+                ):
+                    if device.type == "cuda":
+                        torch.cuda.set_device(device)
+                    path = os.path.join(ckpt_dir, file_name)
+                    with safe_open(path, framework="pt", device="cpu") as fh:
+                        for moe, base, local_slot_id, expert_idx in jobs:
+                            load_expert(moe, base, local_slot_id, expert_idx, fh.get_tensor)
+                    # Handle closed -> pages unmapped -> the drop takes effect.
+                    drop_file_pages(file_name)
 
             def load_split_file_expert(job, files):
-                if device.type == "cuda":
-                    torch.cuda.set_device(device)
-                with ExitStack() as stack:
-                    handles = {
-                        file_name: stack.enter_context(
-                            safe_open(
-                                os.path.join(ckpt_dir, file_name), framework="pt", device="cpu"
+                with log_mem_delta(
+                    "kimi/load_split_file_expert",
+                    min_delta_mib=32,
+                    expert_id=job[3],
+                    num_files=len(files),
+                ):
+                    if device.type == "cuda":
+                        torch.cuda.set_device(device)
+                    with ExitStack() as stack:
+                        handles = {
+                            file_name: stack.enter_context(
+                                safe_open(
+                                    os.path.join(ckpt_dir, file_name),
+                                    framework="pt",
+                                    device="cpu",
+                                )
                             )
-                        )
-                        for file_name in files
-                    }
+                            for file_name in files
+                        }
 
-                    def get_tensor(key):
-                        return handles[weight_map[key]].get_tensor(key)
+                        def get_tensor(key):
+                            return handles[weight_map[key]].get_tensor(key)
 
-                    load_expert(*job, get_tensor)
-                for file_name in files:
-                    drop_file_pages(file_name)
+                        load_expert(*job, get_tensor)
+                    for file_name in files:
+                        drop_file_pages(file_name)
 
             run_concurrently(load_expert_file, sorted(per_file.items()), num_workers=4)
             run_concurrently(load_split_file_expert, split_file_jobs, num_workers=4)

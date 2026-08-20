@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import json
 import mmap
 import os
 import threading
+import weakref
 from unittest import mock
 
 import pytest
@@ -221,6 +224,48 @@ def test_weight_cache_disabled_by_default(tmp_path, monkeypatch):
         loader.load_weights(str(checkpoint_dir), mapping=Mapping())
 
     assert load_weights_in_parallel.call_count == 2
+
+
+def test_kimi_lazy_handles_follow_returned_weights_lifetime(tmp_path, monkeypatch):
+    checkpoint_dir = tmp_path / "kimi-k3"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "config.json").write_text(json.dumps({"model_type": "kimi_k3"}))
+    (checkpoint_dir / "model.safetensors").touch()
+
+    class FakeHandle:
+        def keys(self) -> list[str]:
+            return ["model.weight"]
+
+        def get_slice(self, name: str) -> object:
+            assert name == "model.weight"
+            return object()
+
+    handle_refs: list[weakref.ReferenceType[FakeHandle]] = []
+
+    def open_handle(_file_name: str, *, framework: str, device: str) -> FakeHandle:
+        assert framework == "pt"
+        assert device == "cpu"
+        handle = FakeHandle()
+        handle_refs.append(weakref.ref(handle))
+        return handle
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.checkpoints.hf.weight_loader.safetensors.safe_open",
+        open_handle,
+    )
+
+    loader = HfWeightLoader()
+    weights = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+    assert weights["model.weight"] is not None
+    assert handle_refs[-1]() is not None
+
+    del weights
+    gc.collect()
+    assert handle_refs[-1]() is None
+
+    reloaded_weights = loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+    assert reloaded_weights["model.weight"] is not None
+    assert handle_refs[-1]() is not None
 
 
 def test_weight_cache_detects_inplace_mutation_and_reloads(tmp_path, monkeypatch):

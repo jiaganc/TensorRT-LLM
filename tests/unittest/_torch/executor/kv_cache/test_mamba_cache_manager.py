@@ -81,6 +81,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     SsmLayerConfig,
     _introspection,
+    init_cuda_once,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
 from tensorrt_llm.sampling_params import SamplingParams
@@ -2052,6 +2053,8 @@ def test_expect_snapshot_points_binding_round_trip():
 
 @skip_no_cuda
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
+    init_cuda_once()
+
     def allocated_memory(pool_ratio, descriptors=False):
         mgr = object.__new__(MambaHybridCacheManagerV2)
         mgr._has_cp_helix = False

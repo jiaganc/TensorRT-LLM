@@ -886,10 +886,11 @@ def test_collect_llm_api_config_caps_total_payload_size(monkeypatch):
 
 def test_collect_llm_api_config_captures_pool_ratio_descriptor_lists():
     config = KvCacheConfig(
+        use_kv_cache_manager_v2=True,
         pool_ratio_descriptors=[
             {"match": {"type": "attention", "window_size": None}, "ratio": 0.25},
             {"match": {"window_size": 128, "sink_blocks": 1}, "ratio": 0.75},
-        ]
+        ],
     )
     values, meta = _loads_payloads(config)
     assert values["pool_ratio_descriptors.ratio"] == [0.25, 0.75]

@@ -81,9 +81,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     SsmLayerConfig,
     _introspection,
-    init_cuda_once,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 from tensorrt_llm.sampling_params import SamplingParams
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -81,6 +81,7 @@ modules = [
     "kv_cache_manager_v2/_introspection.py",
     "kv_cache_manager_v2/_life_cycle_registry.py",
     "kv_cache_manager_v2/_page.py",
+    "kv_cache_manager_v2/_pool_ratio.py",
     "kv_cache_manager_v2/_storage_manager.py",
     "kv_cache_manager_v2/_utils.py",
     # _core submodule

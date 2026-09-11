@@ -27,6 +27,7 @@ from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
+from tensorrt_llm.llmapi.llm_args import KvCachePoolRatioDescriptorConfig
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
     KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
@@ -623,10 +624,11 @@ class KvCacheCreator:
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
         self._mapping = mapping
-        self._kv_cache_config = kv_cache_config
+        self._kv_cache_config = kv_cache_config.model_copy(deep=True)
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
         self._max_gpu_total_bytes_in = self._kv_cache_config.max_gpu_total_bytes
         self._pool_ratio_in = self._kv_cache_config.pool_ratio
+        self._pool_ratio_descriptors_in = self._kv_cache_config.pool_ratio_descriptors
         self._avg_seq_len_in = self._kv_cache_config.avg_seq_len
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
@@ -1136,6 +1138,7 @@ class KvCacheCreator:
             # estimation cache and cause warmup to hang or fail. Override it
             # for estimation, then restore it in configure_kv_cache_capacity().
             self._kv_cache_config.pool_ratio = None
+            self._kv_cache_config.pool_ratio_descriptors = None
             self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()
@@ -1321,6 +1324,7 @@ class KvCacheCreator:
         # Estimation uses inferred pool sizing; the final manager uses the
         # user-provided configuration.
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
+        self._kv_cache_config.pool_ratio_descriptors = self._pool_ratio_descriptors_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
         # Reserve headroom for attention workspace the selected backend declares and the profiling forward
@@ -1606,6 +1610,7 @@ class KvCacheCreator:
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
+        inherit_pool_ratios: Optional[bool] = None,
     ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
@@ -1620,6 +1625,10 @@ class KvCacheCreator:
 
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
+        if inherit_pool_ratios is None:
+            inherit_pool_ratios = kv_cache_config_override is None
+        kv_cache_config = KvCacheConfig.model_validate(
+            kv_cache_config.model_dump())
         draft_kv_config = self._get_one_model_draft_kv_cache_config(
             kv_cache_config,
             max_seq_len,
@@ -1629,19 +1638,29 @@ class KvCacheCreator:
                 draft_kv_config.max_attention_window,
                 spec_dec_layer_mask,
             ))
-        if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
-                and draft_kv_config.pool_ratio is not None
-                and len(draft_kv_config.pool_ratio) != 1):
-            # pool_ratio describes one manager's layer-group layout. The
-            # target hybrid manager may have separate recurrent-state and
-            # attention layer groups, while a non-VSWA draft manager has one
-            # attention layer group. Reusing the target's ratios fails its arity
-            # check.
-            logger.info(
-                "Normalizing the separate one-model draft KV cache pool_ratio "
-                f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
-                "layer group.")
-            draft_kv_config.pool_ratio = [1.0]
+        if (inherit_pool_ratios and not uses_vswa_kv_cache_layout(
+                draft_kv_config.max_attention_window)):
+            # Budget-split copies retain target ratios. Explicit draft overrides
+            # are already complete configurations and must resolve unchanged.
+            if draft_kv_config.pool_ratio_descriptors is not None:
+                logger.info(
+                    "Normalizing inherited draft pool_ratio_descriptors to a single "
+                    "100% share; the draft runtime validates the single-group layout."
+                )
+                draft_kv_config = draft_kv_config.model_copy(
+                    update={
+                        "pool_ratio":
+                        None,
+                        "pool_ratio_descriptors":
+                        [KvCachePoolRatioDescriptorConfig(match={}, ratio=1.0)],
+                    })
+            elif draft_kv_config.pool_ratio is not None and len(
+                    draft_kv_config.pool_ratio) != 1:
+                logger.info(
+                    "Normalizing inherited draft pool_ratio to [1.0] for its single layer group."
+                )
+                draft_kv_config = draft_kv_config.model_copy(
+                    update={"pool_ratio": [1.0]})
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
@@ -2217,7 +2236,8 @@ class KvCacheCreator:
                 original_max_seq_len,
                 estimating_kv_cache,
                 kv_cache_config_override=draft_build_kv_cache_config,
-                cold_page_codec_provider=cold_page_codec_provider)
+                cold_page_codec_provider=cold_page_codec_provider,
+                inherit_pool_ratios=True)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
@@ -2393,6 +2413,7 @@ def _create_kv_cache_manager(
     if (estimating_kv_cache
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)
             and kv_cache_config.pool_ratio is None
+            and kv_cache_config.pool_ratio_descriptors is None
             and kv_cache_config.avg_seq_len is not None
             and kv_cache_config.avg_seq_len > max_seq_len):
         # Estimation can build multiple managers from the same temporary

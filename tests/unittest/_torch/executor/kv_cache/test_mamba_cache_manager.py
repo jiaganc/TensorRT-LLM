@@ -2052,7 +2052,7 @@ def test_expect_snapshot_points_binding_round_trip():
 
 @skip_no_cuda
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
-    def allocated_memory(pool_ratio):
+    def allocated_memory(pool_ratio, descriptors=False):
         mgr = object.__new__(MambaHybridCacheManagerV2)
         mgr._has_cp_helix = False
         mgr.kv_cache_type = CacheTypeCpp.SELF
@@ -2076,8 +2076,16 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         mgr.num_extra_kv_tokens = 0
         mgr.get_layer_bytes_per_token = lambda **kwargs: 8
 
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import LayerGroupMatch, PoolRatioDescriptor
+
         kv_cache_config = KvCacheConfig(
-            pool_ratio=pool_ratio,
+            pool_ratio=None if descriptors else pool_ratio,
+            pool_ratio_descriptors=[
+                {"match": {"type": kind}, "ratio": ratio}
+                for kind, ratio in zip(["ssm", "attention"], pool_ratio)
+            ]
+            if descriptors
+            else None,
             enable_partial_reuse=False,
             mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
         )
@@ -2086,7 +2094,13 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
             tokens_per_block=32,
             cache_tiers=[GpuCacheTierConfig(quota=64 << 20)],
             layers=_base_attention_layer_configs(2),
-            initial_pool_ratio=pool_ratio,
+            initial_pool_ratio=None if descriptors else pool_ratio,
+            initial_pool_ratio_descriptors=[
+                PoolRatioDescriptor(LayerGroupMatch(type=kind), ratio)
+                for kind, ratio in zip(["ssm", "attention"], pool_ratio)
+            ]
+            if descriptors
+            else None,
         )
         config = mgr._build_cache_config(base_config)
         runtime_manager = RuntimeKVCacheManager(config)
@@ -2112,6 +2126,15 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     assert high_actual_ratio == pytest.approx([0.75, 0.25])
     assert high_mamba_allocation[0] > low_mamba_allocation[0]
     assert high_mamba_allocation[1] < low_mamba_allocation[1]
+
+    assert allocated_memory([0.25, 0.75], descriptors=True) == (
+        low_mamba_allocation,
+        low_actual_ratio,
+    )
+    assert allocated_memory([0.75, 0.25], descriptors=True) == (
+        high_mamba_allocation,
+        high_actual_ratio,
+    )
 
 
 # ---------------------------------------------------------------------------

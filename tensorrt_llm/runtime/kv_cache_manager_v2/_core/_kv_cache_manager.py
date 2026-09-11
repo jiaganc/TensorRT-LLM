@@ -41,6 +41,7 @@ from .._config import DataRole, KVCacheManagerConfig
 from .._exceptions import LogicError
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
+from .._pool_ratio import resolve_pool_ratios
 from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, SsmSnapshotIterationStatsDelta
 from .._storage._config import BufferId, SlotDesc, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
@@ -268,6 +269,7 @@ class KVCacheManager:
         self._init_config = config
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         self._life_cycles = LifeCycleRegistry(config)
+        initial_pool_ratio = resolve_pool_ratios(config, self._life_cycles)
         storage_config = create_storage_config(config)
         storage = StorageManager(
             self._life_cycles,
@@ -276,7 +278,7 @@ class KVCacheManager:
             config.swa_scratch_reuse,
             typical_batch=config.typical_step,
             constraints=config.constraints,
-            initial_pool_ratio=config.initial_pool_ratio,
+            initial_pool_ratio=initial_pool_ratio,
             event_manager=event_manager,
             max_util_for_resume=config.max_util_for_resume,
         )

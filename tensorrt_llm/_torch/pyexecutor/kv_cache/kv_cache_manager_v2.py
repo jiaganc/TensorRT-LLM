@@ -67,11 +67,13 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
+    LayerGroupMatch,
     LayerId,
     LifeCycleId,
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
+    PoolRatioDescriptor,
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
@@ -1316,14 +1318,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.vocab_size = vocab_size
 
-        config = self._build_base_config(
-            kv_cache_config,
-            tokens_per_block=tokens_per_block,
-            cache_tiers=cache_tiers,
-        )
-        config = self._build_cache_config(config)
-        has_host_cache_tier = any(
-            isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
+        config: Optional[KVCacheManagerConfigPy] = None
+        has_host_cache_tier = any(isinstance(tier, HostCacheTierConfig) for tier in cache_tiers)
+        manager_identity = (
+            f"rank {mapping.rank} {'draft' if self.is_draft else 'target'} KV cache manager"
         )
 
         def create_cold_page_codec(cache_config: object) -> Optional[object]:
@@ -1339,81 +1337,80 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         candidate: Optional[KVCacheManagerPy] = None
-        if not has_host_cache_tier:
+        init_error: Optional[Exception] = None
+        local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
+        try:
+            config = self._build_base_config(
+                kv_cache_config, tokens_per_block=tokens_per_block, cache_tiers=cache_tiers
+            )
+            config = self._build_cache_config(config)
             candidate = KVCacheManagerPy(
                 config,
                 event_manager=self.event_manager,
                 cold_page_codec=create_cold_page_codec(config),
             )
-        else:
-            init_error: Optional[Exception] = None
-            local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
+        except Exception as error:
+            # All constructor errors must reach the collective, including validation
+            # errors on ranks without host offload.
+            if has_host_cache_tier and isinstance(error, (CuError, KVCacheOutOfMemoryError)):
+                local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
+            else:
+                init_error = error.with_traceback(None)
+                local_init_status = _KVCacheManagerInitStatus.ABORT
+
+        init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
+        if init_status == _KVCacheManagerInitStatus.ABORT:
+            if candidate is not None:
+                candidate.shutdown()
+            if init_error is not None:
+                init_error.add_note(f"Initializing {manager_identity}")
+                raise init_error
+            raise RuntimeError(f"{manager_identity} initialization failed on another rank")
+
+        if init_status == _KVCacheManagerInitStatus.USE_NO_HOST:
+            logger.warning(
+                "At least one rank could not use the KV cache manager host tier. "
+                "Rebuilding without the host cache tier on all ranks."
+            )
+            fallback_error: Optional[Exception] = None
             try:
+                if candidate is not None:
+                    candidate.shutdown()
+                candidate = None
+                assert config is not None
+                config = replace(
+                    config,
+                    cache_tiers=[
+                        tier
+                        for tier in config.cache_tiers
+                        if not isinstance(tier, HostCacheTierConfig)
+                    ],
+                )
                 candidate = KVCacheManagerPy(
                     config,
                     event_manager=self.event_manager,
                     cold_page_codec=create_cold_page_codec(config),
                 )
             except Exception as error:
-                if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
-                    local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
-                else:
-                    init_error = error.with_traceback(None)
-                    local_init_status = _KVCacheManagerInitStatus.ABORT
+                fallback_error = error.with_traceback(None)
 
-            init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
-
-            if init_status == _KVCacheManagerInitStatus.ABORT:
+            local_fallback_status = (
+                _KVCacheManagerInitStatus.USE_NO_HOST
+                if fallback_error is None
+                else _KVCacheManagerInitStatus.ABORT
+            )
+            fallback_status = _sync_kv_cache_manager_init_status(local_fallback_status, mapping)
+            if fallback_status == _KVCacheManagerInitStatus.ABORT:
                 if candidate is not None:
                     candidate.shutdown()
-                if init_error is not None:
-                    raise init_error
-                raise RuntimeError("KV cache manager initialization failed on another rank")
-
-            if init_status == _KVCacheManagerInitStatus.USE_NO_HOST:
-                logger.warning(
-                    "At least one rank could not use the KV cache manager host tier "
-                    "(cuMemHostRegister may have failed). Rebuilding without the "
-                    "host cache tier on all ranks."
+                if fallback_error is not None:
+                    fallback_error.add_note(f"Initializing {manager_identity} without host tier")
+                    raise fallback_error
+                raise RuntimeError(
+                    f"{manager_identity} initialization without host tier failed on another rank"
                 )
-                fallback_error: Optional[Exception] = None
-                try:
-                    if candidate is not None:
-                        candidate.shutdown()
-                    candidate = None
-                    config = replace(
-                        config,
-                        cache_tiers=[
-                            tier
-                            for tier in config.cache_tiers
-                            if not isinstance(tier, HostCacheTierConfig)
-                        ],
-                    )
-                    candidate = KVCacheManagerPy(
-                        config,
-                        event_manager=self.event_manager,
-                        cold_page_codec=create_cold_page_codec(config),
-                    )
-                except Exception as error:
-                    fallback_error = error.with_traceback(None)
 
-                local_fallback_status = (
-                    _KVCacheManagerInitStatus.USE_NO_HOST
-                    if fallback_error is None
-                    else _KVCacheManagerInitStatus.ABORT
-                )
-                fallback_status = _sync_kv_cache_manager_init_status(local_fallback_status, mapping)
-
-                if fallback_status == _KVCacheManagerInitStatus.ABORT:
-                    if candidate is not None:
-                        candidate.shutdown()
-                    if fallback_error is not None:
-                        raise fallback_error
-                    raise RuntimeError(
-                        "KV cache manager initialization without the host cache tier "
-                        "failed on another rank"
-                    )
-
+        assert config is not None
         assert candidate is not None
         self.kv_cache_manager_py_config = config
         self.impl = candidate
@@ -2157,7 +2154,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         typical_step = None
         constraints = []
-        if kv_cache_config.pool_ratio is None:
+        kv_cache_config = KvCacheConfig.model_validate(kv_cache_config.model_dump())
+        if kv_cache_config.pool_ratio is None and kv_cache_config.pool_ratio_descriptors is None:
             typical_seq_len = self._get_typical_seq_len(kv_cache_config)
             if typical_seq_len is not None and typical_seq_len > self.max_seq_len:
                 raise ValueError(
@@ -2282,6 +2280,22 @@ class KVCacheManagerV2(BaseResourceManager):
                 and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
             ),
             initial_pool_ratio=kv_cache_config.pool_ratio,
+            initial_pool_ratio_descriptors=(
+                [
+                    PoolRatioDescriptor(
+                        match=LayerGroupMatch(
+                            type=entry.match.type,
+                            window_size_specified="window_size" in entry.match.model_fields_set,
+                            window_size=entry.match.window_size,
+                            sink_blocks=entry.match.sink_blocks,
+                        ),
+                        ratio=entry.ratio,
+                    )
+                    for entry in kv_cache_config.pool_ratio_descriptors
+                ]
+                if kv_cache_config.pool_ratio_descriptors is not None
+                else None
+            ),
         )
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:

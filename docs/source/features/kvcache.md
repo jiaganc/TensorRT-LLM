@@ -142,9 +142,8 @@ This retains snapshots after the first 128 tokens, at the end of the prompt,
 and before the final 32 prompt tokens. Positions outside a particular prompt
 are ignored. Set `avg_seq_len` to the workload's average total sequence length
 so V2 can size the attention KV and Mamba state pools in the right proportion.
-`pool_ratio` contains one positive, normalized cache-tier quota weight per
-layer group in layer-group ID order.
-If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
+Use `pool_ratio_descriptors` for explicit GPU byte shares (see below).
+If neither `avg_seq_len` nor either manual ratio option is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
 `MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector. Hybrid
@@ -154,6 +153,79 @@ Mamba models select V2 by default (see
 compatibility manager. In disaggregated serving, V2 Mamba requires the Python
 NIXL transceiver (`transceiver_runtime: PYTHON`); V1 routes support periodic
 snapshots only.
+
+### Selecting initial KV cache pool ratios (prototype)
+
+`kv_cache_config.pool_ratio_descriptors` assigns initial GPU KV-cache byte shares
+by lifecycle properties, independently of layer-group IDs or descriptor order.
+For example, for a manager with these three effective attention windows:
+
+```yaml
+kv_cache_config:
+  pool_ratio_descriptors:
+    - match: {window_size: null}
+      ratio: 0.22
+    - match: {window_size: 128}
+      ratio: 0.55
+    - match: {window_size: 8}
+      ratio: 0.23
+```
+
+These windows and shares are illustrative, not a recommended model tuning.
+For a hybrid manager with exactly one attention group and one SSM group, use
+`match: {type: attention}` and `match: {type: ssm}` with the desired shares.
+
+The prototype selector fields are:
+
+| Property | When supplied | When omitted |
+| --- | --- | --- |
+| `type` | Exactly `attention` or `ssm`; null is invalid | Either lifecycle type |
+| `window_size` | Positive integer in effective runtime token units; null means full attention | Any window |
+| `sink_blocks` | Nonnegative integer after sink tokens are rounded up by `tokens_per_block`; null is invalid | Any sink count |
+
+Window and sink properties apply only to attention. Combining either with
+`type: ssm` is invalid. Booleans and numeric strings are not selector integers.
+Omission remains a wildcard through configuration serialization; explicit null
+for `window_size` remains a full-attention predicate.
+
+Each required `match` is evaluated independently against the manager's complete
+catalog. It must identify exactly one group, and every group must receive one
+share. Ratios must be finite, positive, and sum to 1.0 within `1e-6`. There is no
+remainder allocation or order-based tie breaking. `match: {}` works only for a
+single-group manager. A broad attention selector remains ambiguous even if a
+second entry identifies one of its candidates. Errors report the selectors,
+matching/available groups, and distinguishing properties; for example, two
+attention groups with the same window may require `sink_blocks`.
+
+Matching runs inside each Python or native runtime manager after the final
+lifecycle registry is built and before storage allocation. Successful resolution
+logs full descriptors, group IDs, and requested GPU byte shares. The scope is
+one manager on one rank. Heterogeneous pipeline stages must each match all
+entries; unmatched entries are errors rather than being dropped or rescaled.
+A separately built single-group draft inherits a 100% share; explicit draft
+configuration overrides must match that draft's own catalog. Multi-group drafts
+validate inherited selectors against their actual layout.
+
+Use effective windows: DeepSeek-V4 speculative decoding can extend configured
+windows. Changing speculative settings can make an old descriptor fail to match;
+there is no nearest-window matching. Models do not assign names or pool IDs.
+
+The legacy `pool_ratio: Optional[List[float]]` is **deprecated** and retains its
+current layer-group ID ordering. Replace its positional entries with descriptors
+for those same groups. `pool_ratio` and `pool_ratio_descriptors` are mutually
+exclusive when non-null; neither takes precedence. Either manual option
+suppresses `avg_seq_len` initial sizing. With both unset, automatic sizing remains
+in effect. Configuration parsing and copying do not emit a runtime warning.
+Each runtime construction supplied with legacy `initial_pool_ratio` emits one
+visible warning recommending `initial_pool_ratio_descriptors` and the LLM API's
+`kv_cache_config.pool_ratio_descriptors`, including for a legacy `[1.0]` input.
+
+Shares describe GPU bytes. Groups sharing a physical hot pool contribute to its
+aggregate allocation; they do not receive separately reserved capacity. Existing
+capacity floors, allocation granularity, and cold-tier slot-ratio projection
+still apply. Pool statistics report effective allocations, which can differ
+from requested shares and change subsequently with opt-in rebalancing. Selecting
+the correct group does not guarantee freedom from CUDA OOM.
 
 ### KV Cache Salting for Secure Reuse
 

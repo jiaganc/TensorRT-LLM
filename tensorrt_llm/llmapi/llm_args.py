@@ -34,7 +34,8 @@ import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, StrictInt, field_validator, model_validator)
+                      PrivateAttr, SerializerFunctionWrapHandler, StrictInt,
+                      field_validator, model_serializer, model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -4145,6 +4146,83 @@ class BlockReuseConfig(StrictBaseModel):
         "`policy` is 'per_conversation'.")
 
 
+class KvCacheLayerGroupMatchConfig(StrictBaseModel):
+    """Prototype selector for one runtime KV-cache lifecycle group."""
+
+    type: Optional[Literal["attention", "ssm"]] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Exact lifecycle type. Omission matches either type; explicit null is invalid."
+    )
+    window_size: Optional[Annotated[int, PydanticField(
+        strict=True, gt=0
+    )]] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Effective attention window in runtime token units. Omission is a wildcard; "
+        "explicit null matches attention without a sliding window. Does not apply to SSM."
+    )
+    sink_blocks: Optional[Annotated[int, PydanticField(
+        strict=True, ge=0
+    )]] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Effective attention sink-block count after rounding sink tokens by tokens_per_block. "
+        "Omission is a wildcard; explicit null is invalid. Does not apply to SSM."
+    )
+
+    @field_validator('type', 'sink_blocks')
+    @classmethod
+    def reject_explicit_null(cls, value: str | int | None) -> str | int:
+        if value is None:
+            raise ValueError(
+                "Omit type or sink_blocks to match any value; explicit null is invalid"
+            )
+        return value
+
+    @model_validator(mode='after')
+    def validate_applicability(self) -> "KvCacheLayerGroupMatchConfig":
+        if self.type == 'ssm' and self.model_fields_set & {
+                'window_size', 'sink_blocks'
+        }:
+            raise ValueError(
+                "SSM selectors cannot specify window_size or sink_blocks")
+        return self
+
+    @model_serializer(mode='wrap')
+    def serialize_selector(
+            self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, str | int | None]:
+        # Parent dumps must preserve wildcards even without exclude_unset=True.
+        return {
+            key: value
+            for key, value in handler(self).items()
+            if key in self.model_fields_set
+        }
+
+
+class KvCachePoolRatioDescriptorConfig(StrictBaseModel):
+    """Prototype GPU byte share assigned to exactly one matching layer group."""
+
+    match: KvCacheLayerGroupMatchConfig = Field(
+        status="prototype",
+        description="Required partial selector. Each entry must independently "
+        "match exactly one group; an empty selector is valid only for a single-group manager."
+    )
+    ratio: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+        strict=True,
+        status="prototype",
+        description=
+        "Positive finite share of the initial GPU KV-cache byte budget. Shares must sum "
+        "to 1.0; shared pools aggregate contributions and capacity floors and granularity still apply."
+    )
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -4375,12 +4453,26 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     pool_ratio: Optional[List[float]] = Field(
         default=None,
         min_length=1,
+        status="deprecated",
+        json_schema_extra={"deprecated": True},
+        description=
+        "Deprecated initial hot-tier byte ratios in layer-group ID order. Use "
+        "pool_ratio_descriptors instead. Values must sum to 1.0. Mutually exclusive with "
+        "pool_ratio_descriptors; either manual option overrides avg_seq_len. Cold tiers preserve "
+        "the implied slot-count ratios. KV cache manager v2 warns when constructed with this option."
+    )
+
+    pool_ratio_descriptors: Optional[List[KvCachePoolRatioDescriptorConfig]] = Field(
+        default=None,
+        min_length=1,
         status="prototype",
-        description="Initial hot-tier byte ratios by layer group for KV cache "
-        "manager v2. Values map to KVCacheManagerV2 layer-group ID order and "
-        "must sum to 1.0. Cold tiers preserve the implied slot-count ratios. Hybrid Mamba "
-        "models and DeepSeek-V4 use this directly, so avg_seq_len does not take "
-        "effect when this is set.")
+        description=
+        "Initial GPU KV-cache byte shares selected by lifecycle properties, independent "
+        "of layer-group order. Every selector must independently match exactly one group and all "
+        "groups on each manager/rank must be covered exactly once. Shares must sum to 1.0. "
+        "Mutually exclusive with pool_ratio; either manual option overrides avg_seq_len. "
+        "When both are null, sizing is automatic. Shared pools aggregate shares; feasibility "
+        "floors and allocation granularity still apply.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     avg_seq_len: Optional[PositiveInt] = Field(
@@ -4390,7 +4482,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Average total sequence length of the serving workload, used to build the "
         "KV cache manager v2 typical step for hybrid Mamba models and DeepSeek-V4. "
         "Hybrid Mamba models warn and fall back to half of max_seq_len when this is "
-        "unset. This does not take effect when pool_ratio is set.")
+        "unset. This does not take effect when pool_ratio or pool_ratio_descriptors is set."
+    )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     block_reuse_config: BlockReuseConfig = Field(
@@ -4556,6 +4649,21 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                     "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
         return v
+
+    @model_validator(mode='after')
+    def validate_pool_ratio_options(self) -> "KvCacheConfig":
+        if self.pool_ratio is not None and self.pool_ratio_descriptors is not None:
+            raise ValueError(
+                "kv_cache_config.pool_ratio and kv_cache_config.pool_ratio_descriptors "
+                "are mutually exclusive")
+        if self.pool_ratio_descriptors is not None and not math.isclose(
+                sum(entry.ratio for entry in self.pool_ratio_descriptors),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1e-6):
+            raise ValueError(
+                "kv_cache_config.pool_ratio_descriptors ratios must sum to 1.0")
+        return self
 
     @field_validator('pool_ratio')
     @classmethod

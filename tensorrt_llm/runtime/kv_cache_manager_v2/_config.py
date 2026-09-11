@@ -17,10 +17,11 @@
 # block index, but different base address.
 # As the ratio between KV data size and KV block scale size is fixed, we can simply use a pool with
 # smaller block size and the same number of blocks for block scale.
+import math
 import os
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import ClassVar, NewType, Protocol
+from typing import ClassVar, Literal, NewType, Protocol
 
 from ._common import CacheTier, LayerId
 
@@ -179,6 +180,60 @@ class SwaScratchReuseConfig:
 
 
 @dataclass(slots=True)
+class LayerGroupMatch:
+    """Runtime selector; window_size_specified distinguishes wildcard from full attention."""
+
+    type: Literal["attention", "ssm"] | None = None
+    window_size_specified: bool = False
+    window_size: int | None = None
+    sink_blocks: int | None = None
+
+    def validate(self) -> None:
+        if self.type not in (None, "attention", "ssm"):
+            raise ValueError("type must be attention or ssm")
+        if type(self.window_size_specified) is not bool:
+            raise ValueError("window_size_specified must be a boolean")
+        if self.window_size is not None and (
+            type(self.window_size) is not int
+            or self.window_size <= 0
+            or not self.window_size_specified
+        ):
+            raise ValueError("window_size must be positive and window_size_specified must be true")
+        if self.sink_blocks is not None and (
+            type(self.sink_blocks) is not int or self.sink_blocks < 0
+        ):
+            raise ValueError("sink_blocks must be a nonnegative integer")
+        if self.type == "ssm" and (self.window_size_specified or self.sink_blocks is not None):
+            raise ValueError("SSM selectors cannot specify window_size or sink_blocks")
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+
+@dataclass(slots=True)
+class PoolRatioDescriptor:
+    """Initial GPU byte share of one independently matched layer group."""
+
+    match: LayerGroupMatch
+    ratio: float
+
+    def validate(self) -> None:
+        if not isinstance(self.match, LayerGroupMatch):
+            raise ValueError("match must be a LayerGroupMatch")
+        self.match.validate()
+        if (
+            isinstance(self.ratio, bool)
+            or not isinstance(self.ratio, (int, float))
+            or not math.isfinite(self.ratio)
+            or self.ratio <= 0
+        ):
+            raise ValueError("descriptor ratio must be finite and positive")
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     """
     Configuration for the KV cache manager.
@@ -270,11 +325,37 @@ class KVCacheManagerConfig:
     flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
     """
 
+    initial_pool_ratio_descriptors: list[PoolRatioDescriptor] | None = None
+    """Order-independent manual GPU byte shares; mutually exclusive with initial_pool_ratio."""
+
+    def validate_pool_ratios(self) -> None:
+        if self.initial_pool_ratio is not None and self.initial_pool_ratio_descriptors is not None:
+            raise ValueError(
+                "initial_pool_ratio and initial_pool_ratio_descriptors are mutually exclusive"
+            )
+        entries = self.initial_pool_ratio_descriptors
+        if entries is not None:
+            if not isinstance(entries, list) or not entries:
+                raise ValueError(
+                    "initial_pool_ratio_descriptors must be a nonempty descriptor list"
+                )
+            for entry in entries:
+                if not isinstance(entry, PoolRatioDescriptor):
+                    raise ValueError(
+                        "initial_pool_ratio_descriptors entries must be PoolRatioDescriptor"
+                    )
+                entry.validate()
+            if not math.isclose(
+                sum(entry.ratio for entry in entries), 1.0, rel_tol=0, abs_tol=1e-6
+            ):
+                raise ValueError("initial_pool_ratio_descriptors ratios must sum to 1.0")
+
     @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self.swa_scratch_reuse is not None
 
     def __post_init__(self) -> None:
+        self.validate_pool_ratios()
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM
         assert len(set(layer.layer_id for layer in self.layers)) == len(self.layers), (
             "duplicate layer id"

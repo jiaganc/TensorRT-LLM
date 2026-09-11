@@ -1007,7 +1007,8 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
     )
 
 
-def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
+@pytest.mark.parametrize("descriptors", [False, True])
+def test_estimation_temporarily_uses_inferred_pool_sizing(descriptors) -> None:
     pool_ratio = [0.2, 0.3, 0.5]
     avg_seq_len = 128
     max_seq_len = 4096
@@ -1015,7 +1016,10 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     estimation_max_tokens = 256
     kv_cache_config = KvCacheConfig(
         max_tokens=user_max_tokens,
-        pool_ratio=pool_ratio,
+        pool_ratio=None if descriptors else pool_ratio,
+        pool_ratio_descriptors=[{"match": {"window_size": None}, "ratio": 1.0}]
+        if descriptors
+        else None,
         avg_seq_len=avg_seq_len,
     )
     model_engine = Mock()
@@ -1072,14 +1076,21 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
         ),
     ):
         assert creator.try_prepare_estimation()
-        assert kv_cache_config.max_tokens == estimation_max_tokens
-        assert kv_cache_config.pool_ratio is None
-        assert kv_cache_config.avg_seq_len == max_seq_len
+        assert creator._kv_cache_config.max_tokens == estimation_max_tokens
+        assert creator._kv_cache_config.pool_ratio is None
+        assert creator._kv_cache_config.pool_ratio_descriptors is None
+        assert creator._kv_cache_config.avg_seq_len == max_seq_len
+        assert kv_cache_config.max_tokens == user_max_tokens
 
         creator.configure_kv_cache_capacity()
 
     assert kv_cache_config.max_tokens == user_max_tokens
-    assert kv_cache_config.pool_ratio == pool_ratio
+    assert creator._kv_cache_config.pool_ratio == (None if descriptors else pool_ratio)
+    assert creator._kv_cache_config.pool_ratio_descriptors == kv_cache_config.pool_ratio_descriptors
+    if descriptors:
+        assert creator._kv_cache_config.pool_ratio_descriptors[0].match.model_fields_set == {
+            "window_size"
+        }
     assert kv_cache_config.avg_seq_len == avg_seq_len
 
 
@@ -1140,11 +1151,13 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
     assert kv_cache_config.avg_seq_len == 2055
 
 
-def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
+@pytest.mark.parametrize("descriptors, explicit", [(False, False), (True, False), (True, True)])
+def test_separate_one_model_draft_normalizes_target_pool_ratio(descriptors, explicit) -> None:
     creator = object.__new__(KvCacheCreator)
     target_pool_ratio = [0.32, 0.68]
     creator._kv_cache_config = KvCacheConfig(
-        pool_ratio=target_pool_ratio,
+        pool_ratio=None if descriptors else target_pool_ratio,
+        pool_ratio_descriptors=[{"match": {"type": "ssm"}, "ratio": 1.0}] if descriptors else None,
         max_attention_window=None,
     )
     creator._max_seq_len = 9472
@@ -1194,9 +1207,16 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
         creator._create_one_model_draft_kv_cache_manager(
             creator._max_seq_len,
             cold_page_codec_provider=codec_provider,
+            kv_cache_config_override=creator._kv_cache_config if explicit else None,
         )
 
     draft_config = create_manager.call_args.kwargs["kv_cache_config"]
-    assert draft_config.pool_ratio == [1.0]
+    if descriptors:
+        assert draft_config.pool_ratio is None
+        assert draft_config.model_dump()["pool_ratio_descriptors"] == [
+            {"match": {"type": "ssm"} if explicit else {}, "ratio": 1.0}
+        ]
+    else:
+        assert draft_config.pool_ratio == [1.0]
     assert create_manager.call_args.kwargs["cold_page_codec_provider"] is codec_provider
-    assert creator._kv_cache_config.pool_ratio == target_pool_ratio
+    assert creator._kv_cache_config.pool_ratio == (None if descriptors else target_pool_ratio)

@@ -1609,6 +1609,61 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("max_rewind_len") = 0)
         .def_rw("max_rewind_len", &kv::SwaScratchReuseConfig::maxRewindLen) DEF_COPY(kv::SwaScratchReuseConfig);
 
+    auto strictSelectorInteger = [](nb::handle value) -> std::optional<int>
+    {
+        if (value.is_none())
+        {
+            return std::nullopt;
+        }
+        if (!PyLong_CheckExact(value.ptr()))
+        {
+            throw nb::value_error("selector integers must be integers, not booleans or strings");
+        }
+        return nb::cast<int>(value);
+    };
+    nb::class_<kv::LayerGroupMatch>(m, "LayerGroupMatch")
+        .def(
+            "__init__",
+            [strictSelectorInteger](kv::LayerGroupMatch* self, std::optional<std::string> type,
+                bool windowSizeSpecified, nb::object windowSize, nb::object sinkBlocks)
+            {
+                kv::LayerGroupMatch value{std::move(type), windowSizeSpecified, strictSelectorInteger(windowSize),
+                    strictSelectorInteger(sinkBlocks)};
+                value.validate();
+                new (self) kv::LayerGroupMatch(std::move(value));
+            },
+            nb::arg("type").none() = std::nullopt, nb::arg("window_size_specified").noconvert() = false,
+            nb::arg("window_size").none() = nb::none(), nb::arg("sink_blocks").none() = nb::none())
+        .def_rw("type", &kv::LayerGroupMatch::type)
+        .def_rw("window_size_specified", &kv::LayerGroupMatch::windowSizeSpecified)
+        .def_prop_rw(
+            "window_size", [](kv::LayerGroupMatch const& self) { return self.windowSize; },
+            [strictSelectorInteger](kv::LayerGroupMatch& self, nb::object value)
+            { self.windowSize = strictSelectorInteger(value); })
+        .def_prop_rw(
+            "sink_blocks", [](kv::LayerGroupMatch const& self) { return self.sinkBlocks; },
+            [strictSelectorInteger](kv::LayerGroupMatch& self, nb::object value)
+            { self.sinkBlocks = strictSelectorInteger(value); })
+        .def("validate", &kv::LayerGroupMatch::validate) DEF_COPY(kv::LayerGroupMatch);
+
+    nb::class_<kv::PoolRatioDescriptor>(m, "PoolRatioDescriptor")
+        .def(
+            "__init__",
+            [](kv::PoolRatioDescriptor* self, kv::LayerGroupMatch match, nb::object ratio)
+            {
+                if (PyBool_Check(ratio.ptr()) || !(PyFloat_Check(ratio.ptr()) || PyLong_Check(ratio.ptr())))
+                {
+                    throw nb::value_error("descriptor ratio must be finite and positive");
+                }
+                kv::PoolRatioDescriptor value{std::move(match), nb::cast<double>(ratio)};
+                value.validate();
+                new (self) kv::PoolRatioDescriptor(std::move(value));
+            },
+            nb::arg("match"), nb::arg("ratio"))
+        .def_rw("match", &kv::PoolRatioDescriptor::match)
+        .def_rw("ratio", &kv::PoolRatioDescriptor::ratio)
+        .def("validate", &kv::PoolRatioDescriptor::validate) DEF_COPY(kv::PoolRatioDescriptor);
+
     nb::class_<kv::KVCacheManagerConfig>(m, "KVCacheManagerConfig")
         .def(
             "__init__",
@@ -1617,7 +1672,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly)
+                bool textOnly, std::optional<std::vector<kv::PoolRatioDescriptor>> initialPoolRatioDescriptors)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1640,6 +1695,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->commitMinSnapshot = commitMinSnapshot;
                 cfg->enableStats = enableStats;
                 cfg->textOnly = textOnly;
+                cfg->initialPoolRatioDescriptors = std::move(initialPoolRatioDescriptors);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1649,7 +1705,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("reuse_match_backoff") = 0, nb::arg("typical_step") = std::nullopt,
             nb::arg("constraints") = std::vector<kv::BatchDesc>{}, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
-            nb::arg("enable_stats") = true, nb::arg("text_only") = false)
+            nb::arg("enable_stats") = true, nb::arg("text_only") = false,
+            nb::arg("initial_pool_ratio_descriptors").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1658,6 +1715,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
+        .def_rw("initial_pool_ratio_descriptors", &kv::KVCacheManagerConfig::initialPoolRatioDescriptors)
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,
             "One positive, normalized cache-tier quota weight per layer group.")
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)

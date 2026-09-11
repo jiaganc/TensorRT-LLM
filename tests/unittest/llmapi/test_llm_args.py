@@ -4521,3 +4521,170 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+@pytest.mark.parametrize("selector", [{}, {
+    "type": "attention"
+}, {
+    "window_size": None
+}, {
+    "window_size": 128,
+    "sink_blocks": 0
+}, {
+    "type": "ssm"
+}])
+def test_KvCacheConfig_descriptor_round_trip(selector):
+    import warnings
+
+    data = {"pool_ratio_descriptors": [{"match": selector, "ratio": 1.0}]}
+    with warnings.catch_warnings(record=True) as captured:
+        config = KvCacheConfig(**data)
+        clones = [
+            config.model_copy(deep=True),
+            KvCacheConfig(**config.model_dump()),
+            KvCacheConfig.model_validate_json(config.model_dump_json()),
+            KvCacheConfig(
+                **yaml.safe_load(yaml.safe_dump(config.model_dump(
+                    mode="json"))))
+        ]
+        for clone in clones:
+            assert clone.model_dump(
+            )["pool_ratio_descriptors"] == data["pool_ratio_descriptors"]
+            assert clone.pool_ratio_descriptors[
+                0].match.model_fields_set == set(selector)
+        assert not captured
+
+
+@pytest.mark.parametrize("entry", [
+    1.0,
+    {},
+    {
+        "ratio": 1.0
+    },
+    {
+        "match": {},
+        "ratio": 0
+    },
+    {
+        "match": {},
+        "ratio": -1
+    },
+    {
+        "match": {},
+        "ratio": float("nan")
+    },
+    {
+        "match": {},
+        "ratio": float("inf")
+    },
+    {
+        "match": {},
+        "ratio": True
+    },
+    {
+        "match": {},
+        "ratio": 0.5
+    },
+    {
+        "match": {
+            "type": None
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "type": "other"
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "sink_blocks": None
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "window_size": True
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "window_size": "128"
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "window_size": 0
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "sink_blocks": -1
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "sink_blocks": False
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "sink_blocks": "0"
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "unknown": 0
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "type": "ssm",
+            "window_size": None
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "type": "ssm",
+            "sink_blocks": 0
+        },
+        "ratio": 1.0
+    },
+])
+def test_KvCacheConfig_descriptor_invalid_entries(entry):
+    with pytest.raises(ValidationError):
+        KvCacheConfig(pool_ratio_descriptors=[entry])
+
+
+def test_KvCacheConfig_descriptor_schema_and_exclusion():
+    descriptors = [{"match": {}, "ratio": 1.0}]
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        KvCacheConfig(pool_ratio=[1.0], pool_ratio_descriptors=descriptors)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(pool_ratio_descriptors=[])
+    with pytest.raises(ValidationError):
+        KvCacheConfig(pool_ratio=descriptors)
+    for config in [
+            KvCacheConfig(),
+            KvCacheConfig(pool_ratio=None, pool_ratio_descriptors=descriptors),
+            KvCacheConfig(pool_ratio=[1.0], pool_ratio_descriptors=None)
+    ]:
+        KvCacheConfig.model_validate_json(config.model_dump_json())
+    schema = KvCacheConfig.model_json_schema()
+    legacy = schema["properties"]["pool_ratio"]
+    assert legacy["default"] is None and legacy["deprecated"] is True
+    assert legacy["status"] == "deprecated"
+    assert legacy["anyOf"][0]["items"]["type"] == "number"
+    new = schema["properties"]["pool_ratio_descriptors"]
+    assert new["default"] is None and new["status"] == "prototype"
+    assert schema["$defs"]["KvCacheLayerGroupMatchConfig"][
+        "additionalProperties"] is False

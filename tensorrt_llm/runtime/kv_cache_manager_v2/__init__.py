@@ -61,6 +61,8 @@ if _BACKEND == "python":
         HostCacheTierConfig,
         KVCacheDesc,
         KVCacheManagerConfig,
+        LayerGroupMatch,
+        PoolRatioDescriptor,
         SsmLayerConfig,
         SwaScratchReuseConfig,
     )
@@ -173,6 +175,8 @@ else:
     KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
     KVCacheManager = _cpp.KVCacheManager
     KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+    LayerGroupMatch = _cpp.LayerGroupMatch
+    PoolRatioDescriptor = _cpp.PoolRatioDescriptor
     IKvCacheColdPageCodec = _cpp.IKvCacheColdPageCodec
     create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page_codec
     # The C++ KVCacheManagerConfig binding replaces the Python @dataclass, but
@@ -202,9 +206,30 @@ else:
         commit_min_snapshot: bool = False
         enable_stats: bool = True
         text_only: bool = False
+        initial_pool_ratio_descriptors: object = None
 
     KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
-    del _KVCacheManagerConfigFieldSpec, _dataclasses
+
+    @_dataclasses.dataclass
+    class _LayerGroupMatchFieldSpec:
+        type: object = None
+        window_size_specified: bool = False
+        window_size: object = None
+        sink_blocks: object = None
+
+    @_dataclasses.dataclass
+    class _PoolRatioDescriptorFieldSpec:
+        match: object = None
+        ratio: float = 0.0
+
+    LayerGroupMatch.__dataclass_fields__ = _LayerGroupMatchFieldSpec.__dataclass_fields__
+    PoolRatioDescriptor.__dataclass_fields__ = _PoolRatioDescriptorFieldSpec.__dataclass_fields__
+    del (
+        _KVCacheManagerConfigFieldSpec,
+        _LayerGroupMatchFieldSpec,
+        _PoolRatioDescriptorFieldSpec,
+        _dataclasses,
+    )
     KVCacheRemovedData = _cpp.KVCacheRemovedData
     KVCacheStatsDelta = _cpp.KVCacheStatsDelta
     KVCacheStoredBlockData = _cpp.KVCacheStoredBlockData
@@ -324,6 +349,8 @@ __all__ = [
     "KVCacheEventManager",
     "KVCacheManager",
     "KVCacheManagerConfig",
+    "LayerGroupMatch",
+    "PoolRatioDescriptor",
     "KVCacheRemovedData",
     "KVCacheStoredBlockData",
     "KVCacheStoredData",

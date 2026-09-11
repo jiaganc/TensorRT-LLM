@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
+#include <cmath>
 #include <filesystem>
 #include <set>
 #include <stdexcept>
@@ -37,8 +38,63 @@ void DiskCacheTierConfig::assertValid() const
     }
 }
 
+void LayerGroupMatch::validate() const
+{
+    if (type && *type != "attention" && *type != "ssm")
+    {
+        throw std::invalid_argument("type must be attention or ssm");
+    }
+    if (windowSize && (!windowSizeSpecified || *windowSize <= 0))
+    {
+        throw std::invalid_argument("window_size must be positive and window_size_specified must be true");
+    }
+    if (sinkBlocks && *sinkBlocks < 0)
+    {
+        throw std::invalid_argument("sink_blocks must be a nonnegative integer");
+    }
+    if (type == "ssm" && (windowSizeSpecified || sinkBlocks))
+    {
+        throw std::invalid_argument("SSM selectors cannot specify window_size or sink_blocks");
+    }
+}
+
+void PoolRatioDescriptor::validate() const
+{
+    match.validate();
+    if (!std::isfinite(ratio) || ratio <= 0)
+    {
+        throw std::invalid_argument("descriptor ratio must be finite and positive");
+    }
+}
+
+void KVCacheManagerConfig::validatePoolRatios() const
+{
+    if (initialPoolRatio && initialPoolRatioDescriptors)
+    {
+        throw std::invalid_argument("initial_pool_ratio and initial_pool_ratio_descriptors are mutually exclusive");
+    }
+    if (initialPoolRatioDescriptors)
+    {
+        if (initialPoolRatioDescriptors->empty())
+        {
+            throw std::invalid_argument("initial_pool_ratio_descriptors must be a nonempty descriptor list");
+        }
+        double sum = 0;
+        for (auto const& entry : *initialPoolRatioDescriptors)
+        {
+            entry.validate();
+            sum += entry.ratio;
+        }
+        if (!std::isfinite(sum) || std::abs(sum - 1.0) > 1e-6)
+        {
+            throw std::invalid_argument("initial_pool_ratio_descriptors ratios must sum to 1.0");
+        }
+    }
+}
+
 void KVCacheManagerConfig::validate() const
 {
+    validatePoolRatios();
     if (swaScratchReuse.has_value())
     {
         swaScratchReuse->validate();

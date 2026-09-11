@@ -1542,3 +1542,74 @@ def test_disagg_role_mapper_kinds_default_to_indexed():
         Role.ALL: MapperKind.INDEXED,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+
+
+@pytest.mark.parametrize("host_bytes", [0, 16 << 20])
+def test_descriptor_constructor_error_is_coordinated(host_bytes):
+    with patch.object(
+        kv_cache_v2_module,
+        "_sync_kv_cache_manager_init_status",
+        return_value=_KVCacheManagerInitStatus.ABORT,
+    ) as sync:
+        with pytest.raises(ValueError, match="matches no layer groups") as error:
+            _make_manager_for_cache_tier_test(
+                KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=host_bytes),
+                [ValueError("initial_pool_ratio_descriptors[0] matches no layer groups")],
+            )
+    sync.assert_called_once()
+    assert sync.call_args.args[0] == _KVCacheManagerInitStatus.ABORT
+    assert "rank 0 target" in error.value.__notes__[0]
+
+
+def test_descriptor_transport_and_copy_conflict():
+    descriptors = [{"match": {"type": "attention"}, "ratio": 1.0}]
+    public = KvCacheConfig(pool_ratio_descriptors=descriptors, avg_seq_len=8192)
+    config = _make_cache_config_for_test(public, max_seq_len=1024)
+    assert config.initial_pool_ratio is None
+    assert config.typical_step is None
+    assert not config.initial_pool_ratio_descriptors[0].match.window_size_specified
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _make_cache_config_for_test(public.model_copy(update={"pool_ratio": [1.0]}))
+
+
+@pytest.mark.parametrize("mode", ["legacy", "descriptors", "automatic"])
+def test_runtime_pool_ratio_warning(mode, capfd):
+    import warnings
+
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        BACKEND,
+        AttentionLayerConfig,
+        BufferConfig,
+        KVCacheManager,
+        LayerGroupMatch,
+        PoolRatioDescriptor,
+    )
+
+    options = (
+        {"initial_pool_ratio": [1.0]}
+        if mode == "legacy"
+        else {"initial_pool_ratio_descriptors": [PoolRatioDescriptor(LayerGroupMatch(), 1.0)]}
+        if mode == "descriptors"
+        else {}
+    )
+    config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+        layers=[AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=4096)])],
+        **options,
+    )
+    capfd.readouterr()
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        manager = KVCacheManager(config)
+        manager.shutdown()
+    output = capfd.readouterr()
+    messages = (
+        "\n".join(str(w.message) for w in captured)
+        if BACKEND == "python"
+        else output.out + output.err
+    )
+    assert messages.count("initial_pool_ratio is deprecated") == int(mode == "legacy")
+    if mode == "legacy":
+        assert "initial_pool_ratio_descriptors" in messages
+        assert "kv_cache_config.pool_ratio_descriptors" in messages

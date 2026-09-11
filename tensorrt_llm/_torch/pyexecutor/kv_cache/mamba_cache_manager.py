@@ -3928,7 +3928,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         ]
 
         typical_step = config.typical_step
-        if config.initial_pool_ratio is None:
+        if (config.initial_pool_ratio is None
+                and config.initial_pool_ratio_descriptors is None):
             typical_capacity = self._get_typical_request_capacity(
                 kv_cache_config)
             request_descs = self._typical_request_descs(typical_capacity,

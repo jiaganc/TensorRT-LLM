@@ -23,6 +23,7 @@ from typing import (
     Final,
     Iterable,
     Iterator,
+    Literal,
     NamedTuple,
     NewType,
     Protocol,
@@ -178,6 +179,20 @@ class BatchDesc:
 class SwaScratchReuseConfig:
     max_rewind_len: int = 0
 
+@dataclass
+class LayerGroupMatch:
+    type: Literal["attention", "ssm"] | None = None
+    window_size_specified: bool = False
+    window_size: int | None = None
+    sink_blocks: int | None = None
+    def validate(self) -> None: ...
+
+@dataclass
+class PoolRatioDescriptor:
+    match: LayerGroupMatch
+    ratio: float
+    def validate(self) -> None: ...
+
 @dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
@@ -197,6 +212,7 @@ class KVCacheManagerConfig:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
+    initial_pool_ratio_descriptors: list[PoolRatioDescriptor] | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

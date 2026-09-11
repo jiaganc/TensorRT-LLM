@@ -98,6 +98,158 @@ std::vector<int> PageIndexConverter::operator()(int baseIndex) const
     return operator()(std::vector<int>{baseIndex}, std::nullopt, nullptr);
 }
 
+namespace
+{
+
+std::string describeSelector(LayerGroupMatch const& selector)
+{
+    std::vector<std::string> fields;
+    if (selector.type)
+    {
+        fields.push_back("type: " + *selector.type);
+    }
+    if (selector.windowSizeSpecified)
+    {
+        fields.push_back("window_size: " + (selector.windowSize ? std::to_string(*selector.windowSize) : "null"));
+    }
+    if (selector.sinkBlocks)
+    {
+        fields.push_back("sink_blocks: " + std::to_string(*selector.sinkBlocks));
+    }
+    std::string result = "{";
+    for (auto const& field : fields)
+    {
+        if (result.size() > 1)
+        {
+            result += ", ";
+        }
+        result += field;
+    }
+    return result + "}";
+}
+
+bool matchesSelector(LayerGroupMatch const& selector, LayerGroupMatch const& group)
+{
+    return (!selector.type || selector.type == group.type)
+        && (!selector.windowSizeSpecified || (group.type == "attention" && selector.windowSize == group.windowSize))
+        && (!selector.sinkBlocks || (group.type == "attention" && selector.sinkBlocks == group.sinkBlocks));
+}
+
+std::optional<std::vector<float>> resolvePoolRatios(
+    KVCacheManagerConfig const& config, LifeCycleRegistry const& registry)
+{
+    config.validatePoolRatios();
+    if (config.initialPoolRatio)
+    {
+        TLLM_LOG_WARNING(
+            "KVCacheManagerV2: initial_pool_ratio is deprecated; use initial_pool_ratio_descriptors "
+            "to configure GPU cache ratios without depending on layer-group ID order. "
+            "For the LLM API, replace kv_cache_config.pool_ratio with kv_cache_config.pool_ratio_descriptors.");
+        return config.initialPoolRatio;
+    }
+    if (!config.initialPoolRatioDescriptors)
+    {
+        return std::nullopt;
+    }
+    std::vector<LayerGroupMatch> catalog;
+    std::string available;
+    for (auto const& [id, lifecycle] : registry)
+    {
+        LayerGroupMatch group;
+        if (auto const* attn = std::get_if<AttnLifeCycle>(&lifecycle))
+        {
+            group = {"attention", true, attn->windowSize, attn->numSinkBlocks};
+        }
+        else
+        {
+            group.type = "ssm";
+        }
+        catalog.push_back(group);
+        available += "\n  " + describeSelector(group);
+    }
+    std::vector<float> ratios(catalog.size());
+    std::vector<std::optional<size_t>> owners(catalog.size());
+    auto const& entries = *config.initialPoolRatioDescriptors;
+    for (size_t index = 0; index < entries.size(); ++index)
+    {
+        auto const& entry = entries[index];
+        std::vector<size_t> matches;
+        for (size_t groupId = 0; groupId < catalog.size(); ++groupId)
+        {
+            if (matchesSelector(entry.match, catalog[groupId]))
+            {
+                matches.push_back(groupId);
+            }
+        }
+        auto const label
+            = "initial_pool_ratio_descriptors[" + std::to_string(index) + "].match " + describeSelector(entry.match);
+        if (matches.empty())
+        {
+            throw std::invalid_argument(label + " matches no layer groups. Available layer groups:" + available);
+        }
+        if (matches.size() > 1)
+        {
+            std::string details;
+            bool differentType = false;
+            bool differentWindow = false;
+            bool differentSink = false;
+            auto const& first = catalog[matches.front()];
+            for (auto const groupId : matches)
+            {
+                auto const& group = catalog[groupId];
+                details += "\n  " + describeSelector(group);
+                differentType |= group.type != first.type;
+                differentWindow |= group.windowSize != first.windowSize;
+                differentSink |= group.sinkBlocks != first.sinkBlocks;
+            }
+            std::string distinguishing;
+            for (auto const& [differs, property] : {std::pair{differentType, "type"},
+                     std::pair{differentWindow, "window_size"}, std::pair{differentSink, "sink_blocks"}})
+            {
+                if (differs)
+                {
+                    if (!distinguishing.empty())
+                    {
+                        distinguishing += ", ";
+                    }
+                    distinguishing += property;
+                }
+            }
+            throw std::invalid_argument(label + " matches " + std::to_string(matches.size())
+                + " layer groups:" + details + "\nSpecify " + distinguishing + " to distinguish them.");
+        }
+        auto const groupId = matches.front();
+        if (owners[groupId])
+        {
+            throw std::invalid_argument("initial_pool_ratio_descriptors entries " + std::to_string(*owners[groupId])
+                + " and " + std::to_string(index) + " target the same layer group "
+                + describeSelector(catalog[groupId]));
+        }
+        owners[groupId] = index;
+        ratios[groupId] = static_cast<float>(entry.ratio);
+    }
+    std::string missing;
+    for (size_t groupId = 0; groupId < catalog.size(); ++groupId)
+    {
+        if (!owners[groupId])
+        {
+            missing += " " + describeSelector(catalog[groupId]);
+        }
+    }
+    if (!missing.empty())
+    {
+        throw std::invalid_argument("initial_pool_ratio_descriptors missing layer groups:" + missing);
+    }
+    for (size_t groupId = 0; groupId < catalog.size(); ++groupId)
+    {
+        TLLM_LOG_INFO("KVCacheManagerV2 initial GPU byte share: %s -> layer_group_id=%zu, ratio=%.9g",
+            describeSelector(catalog[groupId]).c_str(), groupId, ratios[groupId]);
+    }
+    return ratios;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // KvCacheManager
 // ---------------------------------------------------------------------------
@@ -112,13 +264,14 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     , mAvgSqrHistoryLength(0.9999)
 {
     mConfig.validate();
+    auto const initialPoolRatio = resolvePoolRatios(mConfig, mLifeCycles);
 
     mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock, mEventSink);
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
-        std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
-        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
+        std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, initialPoolRatio,
+        mEventSink, mConfig.maxUtilForResume);
 
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();

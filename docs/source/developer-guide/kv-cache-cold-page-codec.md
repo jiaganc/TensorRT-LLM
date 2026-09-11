@@ -150,6 +150,21 @@ computes these weights by lifecycle. Hot initialization sums the lifecycle byte 
 group. Cold initialization first converts each hot byte weight to its implied slot-count weight, then converts that
 weight to cold bytes using the lifecycle's cold-page size and sums it into the cold pool group. This preserves
 layer-group slot-count proportions when hot and cold representations use different page sizes or pool-group mappings.
+The prototype `KvCacheConfig.pool_ratio_descriptors` option is transported as typed
+`initial_pool_ratio_descriptors` records (`initialPoolRatioDescriptors` in C++).
+Each runtime resolves these against its own finalized lifecycle registry before
+allocating storage, producing the same numeric layer-group vector used below.
+The original selector configuration is preserved, including across host-tier
+retries. Matching concerns layer groups, never cold pool-group IDs. The numeric
+`StorageManager` allocation contract and hot/cold projection are unchanged.
+
+Legacy public `pool_ratio` and runtime `initial_pool_ratio` are deprecated and
+mutually exclusive with their descriptor replacements. The runtime constructor
+warns only when the legacy input is supplied; internally resolved vectors do not
+trigger that warning. An explicitly supplied native codec is consumed by a
+construction attempt even when selector validation fails, as with other
+constructor failures; retry with a newly created codec.
+
 Runtime sampling remains level-specific and byte-based. The low-level `initial_pool_ratio` and the higher-level
 `KvCacheConfig.pool_ratio` therefore contain exactly one hot-tier byte ratio per layer group in layer-group ID order,
 not one per hot pool group.

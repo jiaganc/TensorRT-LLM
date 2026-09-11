@@ -23,7 +23,7 @@ import random
 import time
 import unittest
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
@@ -48,8 +48,10 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManager,
         KVCacheManagerConfig,
         LayerGroupId,
+        LayerGroupMatch,
         LayerId,
         PlannedDropHandle,
+        PoolRatioDescriptor,
         ReuseScope,
         SsmLayerConfig,
         SwaScratchReuseConfig,
@@ -102,8 +104,10 @@ else:
         KVCacheManager,
         KVCacheManagerConfig,
         LayerGroupId,
+        LayerGroupMatch,
         LayerId,
         PlannedDropHandle,
+        PoolRatioDescriptor,
         ReuseScope,
         SsmLayerConfig,
         SwaScratchReuseConfig,
@@ -144,7 +148,7 @@ else:
         typed_range,
     )
 
-from copy import deepcopy
+from copy import copy, deepcopy
 
 from parameterized import parameterized
 
@@ -527,8 +531,11 @@ class TestNoBatching(TestKVCacheManagerV2):
             if hasattr(self, "manager"):
                 self.manager.clear_reusable_blocks()
 
+    @parameterized.expand([("numeric", False), ("descriptors", True)])
     @requires_cpp_backend
-    def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(self) -> None:
+    def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(
+        self, _name, descriptors
+    ) -> None:
         """Padding merges full attention with one of two differently-sized SWA LCs."""
         unit = 1 << 20
         self.cfg = KVCacheManagerConfig(
@@ -559,6 +566,17 @@ class TestNoBatching(TestKVCacheManagerV2):
             constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=12, history_length=0)])],
             max_util_for_resume=1.0,
         )
+        if descriptors:
+            self.cfg = replace(
+                self.cfg,
+                initial_pool_ratio=None,
+                initial_pool_ratio_descriptors=[
+                    PoolRatioDescriptor(
+                        LayerGroupMatch(window_size_specified=True, window_size=window), 1 / 3
+                    )
+                    for window in [None, 4, 8]
+                ],
+            )
         self.engine = FakeEngine(self.cfg)
         codec = _introspection.create_test_padding_cold_page_codec(
             {0: 4 * unit, 1: 4 * unit, 2: 2 * unit}
@@ -3362,6 +3380,185 @@ class TestClampMaxSeqLenForMem(unittest.TestCase):
         self.assertEqual(
             manager.clamp_max_seq_len_for_mem(batch_size=2, token_num_upper_bound=96), 32
         )
+
+
+class TestPoolRatioDescriptors(unittest.TestCase):
+    def setUp(self):
+        self.config = TestInitRatioConfig()._make_config()
+        self.entries = [
+            PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True, window_size=128), 0.25),
+            PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 0.75),
+        ]
+
+    def allocation(self, config):
+        manager = KVCacheManager(config)
+        try:
+            return {
+                buffer.layer_id: (group.num_slots, tuple(pool.slot_bytes for pool in group.pools))
+                for group in manager.pool_group_descs
+                for variant in group.slot_desc.variants
+                for coalesced in variant.coalesced_buffers
+                for buffer in coalesced.buffer_ids
+            }
+        finally:
+            manager.shutdown()
+
+    def test_order_independent_allocation_and_copy(self):
+        expected = self.allocation(replace(self.config, initial_pool_ratio=[0.25, 0.75]))
+        config = replace(self.config, initial_pool_ratio_descriptors=self.entries)
+        for cloned in [config, copy(config), deepcopy(config), replace(config)]:
+            for layers in [cloned.layers, list(reversed(cloned.layers))]:
+                for entries in [self.entries, list(reversed(self.entries))]:
+                    actual = replace(cloned, layers=layers, initial_pool_ratio_descriptors=entries)
+                    self.assertEqual(self.allocation(actual), expected)
+                    self.assertIsNone(actual.initial_pool_ratio)
+                    self.assertTrue(
+                        actual.initial_pool_ratio_descriptors[0].match.window_size_specified
+                    )
+        self.assertEqual(replace(self.entries[0].match).window_size, 128)
+        self.assertIsNone(deepcopy(self.entries[1]).match.window_size)
+
+    def test_shared_hot_pool(self):
+        layers = list(self.config.layers)
+        layers[1] = AttentionLayerConfig(layer_id=layers[1].layer_id, buffers=layers[0].buffers)
+        config = replace(self.config, layers=layers)
+        expected = self.allocation(replace(config, initial_pool_ratio=[0.25, 0.75]))
+        self.assertEqual(
+            self.allocation(replace(config, initial_pool_ratio_descriptors=self.entries)), expected
+        )
+
+    def test_single_group_empty_selector(self):
+        config = replace(self.config, layers=self.config.layers[:1])
+        self.assertEqual(
+            self.allocation(replace(config, initial_pool_ratio=[1.0])),
+            self.allocation(
+                replace(
+                    config,
+                    initial_pool_ratio_descriptors=[PoolRatioDescriptor(LayerGroupMatch(), 1.0)],
+                )
+            ),
+        )
+
+    def test_matching_failures(self):
+        cases = [
+            (
+                [
+                    PoolRatioDescriptor(
+                        LayerGroupMatch(window_size_specified=True, window_size=8), 1.0
+                    )
+                ],
+                "matches no layer groups",
+            ),
+            (
+                [PoolRatioDescriptor(LayerGroupMatch(type="attention"), 1.0)],
+                "matches 2 layer groups",
+            ),
+            ([PoolRatioDescriptor(LayerGroupMatch(), 1.0)], "matches 2 layer groups"),
+            (
+                [
+                    PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 0.5),
+                    PoolRatioDescriptor(LayerGroupMatch(type="attention"), 0.5),
+                ],
+                "matches 2 layer groups",
+            ),
+            (
+                [PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 0.5)] * 2,
+                "entries 0 and 1 target the same",
+            ),
+            (
+                [PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 1.0)],
+                "missing layer groups",
+            ),
+        ]
+        for entries, error in cases:
+            with self.subTest(error=error):
+                config = replace(self.config, initial_pool_ratio_descriptors=entries)
+                with self.assertRaisesRegex(ValueError, error):
+                    KVCacheManager(config)
+
+    def test_effective_sink_rounding(self):
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(i),
+                buffers=self.config.layers[i].buffers,
+                sliding_window_size=128,
+                num_sink_tokens=sink,
+            )
+            for i, sink in enumerate([0, 1])
+        ]
+        config = replace(self.config, layers=layers)
+        entries = [
+            PoolRatioDescriptor(
+                LayerGroupMatch(window_size_specified=True, window_size=128, sink_blocks=i), ratio
+            )
+            for i, ratio in enumerate([0.25, 0.75])
+        ]
+        self.assertEqual(
+            self.allocation(replace(config, initial_pool_ratio=[0.25, 0.75])),
+            self.allocation(replace(config, initial_pool_ratio_descriptors=entries)),
+        )
+        with self.assertRaisesRegex(ValueError, "Specify sink_blocks"):
+            KVCacheManager(
+                replace(
+                    config,
+                    initial_pool_ratio_descriptors=[
+                        PoolRatioDescriptor(
+                            LayerGroupMatch(window_size_specified=True, window_size=128), 1.0
+                        )
+                    ],
+                )
+            )
+
+    def test_ssm_does_not_match_attention_properties(self):
+        config = TestInitRatioConfig()._make_hybrid_config()
+        entries = [
+            PoolRatioDescriptor(LayerGroupMatch(type="ssm"), 0.75),
+            PoolRatioDescriptor(LayerGroupMatch(type="attention"), 0.25),
+        ]
+        self.assertEqual(
+            self.allocation(replace(config, initial_pool_ratio=[0.75, 0.25])),
+            self.allocation(replace(config, initial_pool_ratio_descriptors=entries)),
+        )
+        # Only SSM remains; attention-only properties must produce zero matches.
+        config = replace(
+            config, layers=[layer for layer in config.layers if isinstance(layer, SsmLayerConfig)]
+        )
+        for selector in [
+            LayerGroupMatch(window_size_specified=True),
+            LayerGroupMatch(sink_blocks=0),
+        ]:
+            with self.assertRaisesRegex(ValueError, "matches no layer groups"):
+                KVCacheManager(
+                    replace(
+                        config, initial_pool_ratio_descriptors=[PoolRatioDescriptor(selector, 1.0)]
+                    )
+                )
+
+    def test_mutated_runtime_config_is_validated(self):
+        config = replace(self.config, initial_pool_ratio_descriptors=self.entries)
+        config.initial_pool_ratio = [0.25, 0.75]
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            KVCacheManager(config)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            replace(config)
+
+    def test_runtime_record_validation(self):
+        for kwargs in [
+            dict(window_size=128),
+            dict(window_size_specified=True, window_size=0),
+            dict(window_size_specified=True, window_size=True),
+            dict(sink_blocks="0"),
+            dict(sink_blocks=-1),
+            dict(type="ssm", window_size_specified=True),
+        ]:
+            with self.subTest(kwargs=kwargs), self.assertRaises((ValueError, TypeError)):
+                LayerGroupMatch(**kwargs)
+        for ratio in [0, -1, float("nan"), float("inf"), True, "1"]:
+            with self.subTest(ratio=ratio), self.assertRaises((ValueError, TypeError)):
+                PoolRatioDescriptor(LayerGroupMatch(), ratio)
+        for entries in [[], [1.0], [PoolRatioDescriptor(LayerGroupMatch(), 0.5)]]:
+            with self.subTest(entries=entries), self.assertRaises((ValueError, TypeError)):
+                replace(self.config, initial_pool_ratio_descriptors=entries)
 
 
 class TestInitRatioConfig(unittest.TestCase):

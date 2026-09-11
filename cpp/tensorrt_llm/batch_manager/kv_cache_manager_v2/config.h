@@ -258,6 +258,26 @@ struct SwaScratchReuseConfig
 // Top-level KV cache manager configuration (mirrors _config.py::KVCacheManagerConfig).
 // ---------------------------------------------------------------------------
 
+//! Partial lifecycle selector. Presence is independent of a null (full-attention) window.
+struct LayerGroupMatch
+{
+    std::optional<std::string> type;
+    bool windowSizeSpecified = false;
+    std::optional<int> windowSize;
+    std::optional<int> sinkBlocks;
+
+    void validate() const;
+};
+
+//! Initial GPU byte share for exactly one independently matched lifecycle.
+struct PoolRatioDescriptor
+{
+    LayerGroupMatch match;
+    double ratio = 0;
+
+    void validate() const;
+};
+
 struct KVCacheManagerConfig
 {
     int tokensPerBlock = 0;
@@ -289,7 +309,7 @@ struct KVCacheManagerConfig
     std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation
     // One normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
     // layer-group slot-count proportions while accounting for cold page sizes.
-    std::optional<std::vector<float>> initialPoolRatio; // overrides inferred sizing inputs
+    std::optional<std::vector<float>> initialPoolRatio; // deprecated; use initialPoolRatioDescriptors
 
     // When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
     // Scratch blocks share coalesced slot sub-pages across blocks for the currently executing
@@ -310,6 +330,10 @@ struct KVCacheManagerConfig
     // path without scanning. A per-KvCache text_only override may only tighten this
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
+
+    std::optional<std::vector<PoolRatioDescriptor>> initialPoolRatioDescriptors;
+
+    void validatePoolRatios() const;
 
     bool enableSwaScratchReuse() const noexcept
     {

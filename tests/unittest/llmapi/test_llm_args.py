@@ -4666,6 +4666,8 @@ def test_KvCacheConfig_descriptor_invalid_entries(entry):
 
 
 def test_KvCacheConfig_descriptor_schema_and_exclusion():
+    assert public_llmapi.KvCacheLayerGroupMatchConfig is llm_args_mod.KvCacheLayerGroupMatchConfig
+    assert public_llmapi.KvCachePoolRatioDescriptorConfig is llm_args_mod.KvCachePoolRatioDescriptorConfig
     descriptors = [{"match": {}, "ratio": 1.0}]
     with pytest.raises(ValidationError, match="mutually exclusive"):
         KvCacheConfig(pool_ratio=[1.0], pool_ratio_descriptors=descriptors)
@@ -4688,3 +4690,26 @@ def test_KvCacheConfig_descriptor_schema_and_exclusion():
     assert new["default"] is None and new["status"] == "prototype"
     assert schema["$defs"]["KvCacheLayerGroupMatchConfig"][
         "additionalProperties"] is False
+
+
+def test_KvCacheConfig_descriptor_cli_merge():
+    base = {"kv_cache_config": KvCacheConfig(pool_ratio=[1.0])}
+    override = {
+        "kv_cache_config": {
+            "pool_ratio_descriptors": [{
+                "match": {
+                    "type": "attention"
+                },
+                "ratio": 1.0
+            }]
+        }
+    }
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        llm_args_mod.update_llm_args_with_extra_dict(base, override)
+    override["kv_cache_config"]["pool_ratio"] = None
+    merged = llm_args_mod.update_llm_args_with_extra_dict(base, override)
+    config = merged["kv_cache_config"]
+    assert config.pool_ratio is None
+    assert config.model_dump()["pool_ratio_descriptors"] == override[
+        "kv_cache_config"]["pool_ratio_descriptors"]
+    assert base["kv_cache_config"].pool_ratio == [1.0]

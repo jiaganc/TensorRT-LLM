@@ -1344,6 +1344,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache_config, tokens_per_block=tokens_per_block, cache_tiers=cache_tiers
             )
             config = self._build_cache_config(config)
+            has_host_cache_tier = any(
+                isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
+            )
             candidate = KVCacheManagerPy(
                 config,
                 event_manager=self.event_manager,

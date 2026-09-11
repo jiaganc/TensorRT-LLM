@@ -280,6 +280,7 @@ class KVCacheManagerConfig:
 
     initial_pool_ratio: list[float] | None = None
     """
+    Deprecated: use initial_pool_ratio_descriptors for order-independent selection.
     One positive, normalized hot-tier byte-quota weight per layer group. Cold-tier
     initialization preserves the implied layer-group slot-count proportions while
     accounting for cold page sizes. When set, this takes precedence over typical_step

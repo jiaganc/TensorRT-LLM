@@ -1616,6 +1616,7 @@ def test_runtime_pool_ratio_warning(mode, capfd):
         PoolRatioDescriptor,
     )
 
+    init_cuda_once()
     options = (
         {"initial_pool_ratio": [1.0]}
         if mode == "legacy"
@@ -1705,6 +1706,7 @@ def test_descriptor_failure_consumes_explicit_native_codec():
 
     if runtime.BACKEND != "cpp":
         pytest.skip("native cold-page codecs")
+    init_cuda_once()
     config = runtime.KVCacheManagerConfig(
         tokens_per_block=32,
         cache_tiers=[runtime.GpuCacheTierConfig(quota=16 << 20)],

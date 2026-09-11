@@ -531,11 +531,8 @@ class TestNoBatching(TestKVCacheManagerV2):
             if hasattr(self, "manager"):
                 self.manager.clear_reusable_blocks()
 
-    @parameterized.expand([("numeric", False), ("descriptors", True)])
     @requires_cpp_backend
-    def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(
-        self, _name, descriptors
-    ) -> None:
+    def test_cold_codec_merges_lifecycles_from_different_hot_pool_groups(self) -> None:
         """Padding merges full attention with one of two differently-sized SWA LCs."""
         unit = 1 << 20
         self.cfg = KVCacheManagerConfig(
@@ -566,17 +563,6 @@ class TestNoBatching(TestKVCacheManagerV2):
             constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=12, history_length=0)])],
             max_util_for_resume=1.0,
         )
-        if descriptors:
-            self.cfg = replace(
-                self.cfg,
-                initial_pool_ratio=None,
-                initial_pool_ratio_descriptors=[
-                    PoolRatioDescriptor(
-                        LayerGroupMatch(window_size_specified=True, window_size=window), 1 / 3
-                    )
-                    for window in [None, 4, 8]
-                ],
-            )
         self.engine = FakeEngine(self.cfg)
         codec = _introspection.create_test_padding_cold_page_codec(
             {0: 4 * unit, 1: 4 * unit, 2: 2 * unit}
@@ -3384,6 +3370,7 @@ class TestClampMaxSeqLenForMem(unittest.TestCase):
 
 class TestPoolRatioDescriptors(unittest.TestCase):
     def setUp(self):
+        init_cuda_once()
         self.config = TestInitRatioConfig()._make_config()
         self.entries = [
             PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True, window_size=128), 0.25),
@@ -3426,6 +3413,27 @@ class TestPoolRatioDescriptors(unittest.TestCase):
         self.assertEqual(
             self.allocation(replace(config, initial_pool_ratio_descriptors=self.entries)), expected
         )
+
+    @requires_cpp_backend
+    def test_native_cold_projection_matches_numeric_allocation(self):
+        config = TestInitRatioConfig()._make_config(host_quota=128 << 20)
+
+        def cold_allocation(candidate):
+            codec = _introspection.create_test_padding_cold_page_codec({0: 2 << 20, 1: 2 << 20})
+            manager = KVCacheManager(candidate, cold_page_codec=codec)
+            try:
+                return [
+                    (stat.total, tuple(stat.slot_sizes))
+                    for stat in _introspection.storage_statistics(manager, 1)
+                ]
+            finally:
+                manager.shutdown()
+
+        expected = cold_allocation(replace(config, initial_pool_ratio=[0.25, 0.75]))
+        self.assertEqual(
+            cold_allocation(replace(config, initial_pool_ratio_descriptors=self.entries)), expected
+        )
+        self.assertEqual(len(expected), 1)
 
     def test_single_group_empty_selector(self):
         config = replace(self.config, layers=self.config.layers[:1])

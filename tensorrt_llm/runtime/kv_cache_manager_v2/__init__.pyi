@@ -205,6 +205,7 @@ class KVCacheManagerConfig:
     reuse_match_backoff: int = 0
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
+    # Deprecated: use initial_pool_ratio_descriptors.
     # One positive, normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
     # layer-group slot-count proportions.
     initial_pool_ratio: list[float] | None = None

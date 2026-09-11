@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -154,6 +155,7 @@ def _make_manager_for_cache_tier_test(
     is_disagg: bool = False,
     joint_reuse: bool = False,
     mapping: Mapping | None = None,
+    runtime_config: KVCacheManagerConfig | None = None,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -167,6 +169,8 @@ def _make_manager_for_cache_tier_test(
         cache_tiers: list[object],
     ) -> _FakeManagerConfig:
         del self, config, tokens_per_block
+        if runtime_config is not None:
+            return replace(runtime_config, cache_tiers=cache_tiers)
         return _FakeManagerConfig(cache_tiers=cache_tiers)
 
     def build_cache_config(
@@ -1558,18 +1562,45 @@ def test_descriptor_constructor_error_is_coordinated(host_bytes):
             )
     sync.assert_called_once()
     assert sync.call_args.args[0] == _KVCacheManagerInitStatus.ABORT
-    assert "rank 0 target" in error.value.__notes__[0]
+    if sys.version_info >= (3, 11):
+        assert "rank 0 target" in error.value.__notes__[0]
 
 
 def test_descriptor_transport_and_copy_conflict():
     descriptors = [{"match": {"type": "attention"}, "ratio": 1.0}]
-    public = KvCacheConfig(pool_ratio_descriptors=descriptors, avg_seq_len=8192)
-    config = _make_cache_config_for_test(public, max_seq_len=1024)
-    assert config.initial_pool_ratio is None
-    assert config.typical_step is None
-    assert not config.initial_pool_ratio_descriptors[0].match.window_size_specified
+    public = KvCacheConfig(
+        pool_ratio_descriptors=descriptors,
+        avg_seq_len=8192,
+        max_gpu_total_bytes=16 << 20,
+        host_cache_size=0,
+    )
+
+    def construct(config):
+        return KVCacheManagerV2(
+            config,
+            CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            vocab_size=4096,
+        )
+
+    manager = construct(public)
+    try:
+        assert manager.get_num_available_tokens(token_num_upper_bound=1024) > 0
+        config = manager.kv_cache_manager_py_config
+        assert config.initial_pool_ratio is None
+        assert config.typical_step is None
+        assert not config.initial_pool_ratio_descriptors[0].match.window_size_specified
+    finally:
+        manager.shutdown()
+    assert public.model_dump()["pool_ratio_descriptors"] == descriptors
     with pytest.raises(ValueError, match="mutually exclusive"):
-        _make_cache_config_for_test(public.model_copy(update={"pool_ratio": [1.0]}))
+        construct(public.model_copy(update={"pool_ratio": [1.0]}))
 
 
 @pytest.mark.parametrize("mode", ["legacy", "descriptors", "automatic"])
@@ -1613,3 +1644,91 @@ def test_runtime_pool_ratio_warning(mode, capfd):
     if mode == "legacy":
         assert "initial_pool_ratio_descriptors" in messages
         assert "kv_cache_config.pool_ratio_descriptors" in messages
+
+
+def _multi_rank_descriptor_error_worker():
+    from tensorrt_llm._utils import mpi_rank, mpi_world_size
+
+    rank = mpi_rank()
+    candidate = Mock()
+    with pytest.raises((ValueError, RuntimeError)) as error:
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=0),
+            [candidate] if rank == 0 else [ValueError("selector matches no layer groups")],
+            mapping=Mapping(world_size=mpi_world_size(), rank=rank, tp_size=mpi_world_size()),
+        )
+    return rank, candidate.shutdown.call_count, str(error.value)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device (MPI) build required")
+def test_descriptor_mismatch_on_one_rank_aborts_all_ranks():
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    session = MpiPoolSession(n_workers=2)
+    try:
+        results = sorted(
+            future.result(timeout=60)
+            for future in session.submit(_multi_rank_descriptor_error_worker)
+        )
+    finally:
+        session.shutdown(wait=False)
+    assert results[0][0:2] == (0, 1)
+    assert "failed on another rank" in results[0][2]
+    assert results[1][0:2] == (1, 0)
+    assert "matches no layer groups" in results[1][2]
+
+
+def test_host_fallback_preserves_unresolved_descriptors():
+    public = KvCacheConfig(
+        pool_ratio_descriptors=[{"match": {"window_size": None}, "ratio": 1.0}],
+        max_gpu_total_bytes=16 << 20,
+        host_cache_size=16 << 20,
+    )
+    config = _make_cache_config_for_test(public)
+    manager, constructor = _make_manager_for_cache_tier_test(
+        public, [_CacheTierInitError("host registration failed"), Mock()], runtime_config=config
+    )
+    try:
+        assert constructor.call_count == 2
+        for call in constructor.call_args_list:
+            transported = call.args[0]
+            assert transported.initial_pool_ratio is None
+            assert transported.initial_pool_ratio_descriptors[0].match.window_size_specified
+            assert transported.initial_pool_ratio_descriptors[0].match.window_size is None
+    finally:
+        manager.shutdown()
+
+
+def test_descriptor_failure_consumes_explicit_native_codec():
+    from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime
+
+    if runtime.BACKEND != "cpp":
+        pytest.skip("native cold-page codecs")
+    config = runtime.KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[runtime.GpuCacheTierConfig(quota=16 << 20)],
+        layers=[
+            runtime.AttentionLayerConfig(
+                layer_id=0, buffers=[runtime.BufferConfig(role="key", size=4096)]
+            )
+        ],
+        initial_pool_ratio_descriptors=[
+            runtime.PoolRatioDescriptor(runtime.LayerGroupMatch(type="ssm"), 1.0)
+        ],
+    )
+    codec = runtime.create_default_kv_cache_cold_page_codec()
+    with pytest.raises(ValueError, match="matches no layer groups"):
+        runtime.KVCacheManager(config, cold_page_codec=codec)
+    valid = replace(
+        config,
+        initial_pool_ratio_descriptors=[
+            runtime.PoolRatioDescriptor(runtime.LayerGroupMatch(), 1.0)
+        ],
+    )
+    with pytest.raises(TypeError, match="already been consumed"):
+        runtime.KVCacheManager(valid, cold_page_codec=codec)
+    manager = runtime.KVCacheManager(
+        valid, cold_page_codec=runtime.create_default_kv_cache_cold_page_codec()
+    )
+    manager.shutdown()

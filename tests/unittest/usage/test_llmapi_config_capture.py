@@ -882,3 +882,21 @@ def test_collect_llm_api_config_caps_total_payload_size(monkeypatch):
     config, meta = _loads_payloads(_BigConfig())
     assert meta["payload_truncated"] is True
     assert len(rc._canonical_json(config).encode("utf-8")) <= 20
+
+
+def test_collect_llm_api_config_captures_pool_ratio_descriptor_lists():
+    config = KvCacheConfig(
+        pool_ratio_descriptors=[
+            {"match": {"type": "attention", "window_size": None}, "ratio": 0.25},
+            {"match": {"window_size": 128, "sink_blocks": 1}, "ratio": 0.75},
+        ]
+    )
+    values, meta = _loads_payloads(config)
+    assert values["pool_ratio_descriptors.ratio"] == [0.25, 0.75]
+    assert values["pool_ratio_descriptors.match.type"] == ["attention", None]
+    assert values["pool_ratio_descriptors.match.window_size"] == [None, 128]
+    assert values["pool_ratio_descriptors.match.sink_blocks"] == [None, 1]
+    assert meta["capture_succeeded"] is True
+    assert meta["unsafe_excluded"] is False
+    assert config.pool_ratio_descriptors[0].match.model_fields_set == {"type", "window_size"}
+    assert config.pool_ratio_descriptors[1].match.model_fields_set == {"window_size", "sink_blocks"}

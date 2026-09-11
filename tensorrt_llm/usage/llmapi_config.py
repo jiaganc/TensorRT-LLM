@@ -257,29 +257,26 @@ def _domain_values(annotation: Any, metadata: dict[str, Any]) -> list[str]:
     return seen
 
 
-def _nested_models(annotation: Any) -> list[type]:
-    """Every BaseModel reachable in an annotation tree.
+def _nested_models(annotation: Any) -> list[tuple[type, int]]:
+    """Reachable BaseModels and their sequence depth; dicts are not traversed."""
+    out: list[tuple[type, int]] = []
 
-    Covers Optional / Union / discriminated-union arms / list|tuple|set element
-    types. dict is NOT traversed (keys/values are not captured).
-    """
-    out: list[type] = []
-
-    def rec(ann: Any) -> None:
+    def rec(ann: Any, depth: int) -> None:
         ann = _unwrap_annotated(ann)
         if isinstance(ann, type) and issubclass(ann, BaseModel):
-            out.append(ann)
+            entry = (ann, depth)
+            if entry not in out:
+                out.append(entry)
             return
-        if _is_union(ann) or get_origin(ann) in {list, tuple, set}:
+        if _is_union(ann):
             for arg in get_args(ann):
-                rec(arg)
+                rec(arg, depth)
+        elif get_origin(ann) in {list, tuple, set}:
+            for arg in get_args(ann):
+                rec(arg, depth + 1)
 
-    rec(annotation)
-    deduped: list[type] = []
-    for m in out:
-        if m not in deduped:
-            deduped.append(m)
-    return deduped
+    rec(annotation, 0)
+    return out
 
 
 def _defining_class(cls: type, field_name: str) -> str:
@@ -311,7 +308,7 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
     """
     rows: list[dict[str, Any]] = []
 
-    def walk(cls: type, prefix: str, stack: tuple) -> None:
+    def walk(cls: type, prefix: str, stack: tuple, sequence_depth: int = 0) -> None:
         if cls in stack:
             return
         for fname, finfo in cls.model_fields.items():
@@ -320,20 +317,23 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
             meta = _get_telemetry_metadata(finfo)
             if _field_is_selected(ann, meta):
                 normalized = meta if (meta and not _is_explicit_exclude(meta)) else {}
+                capture_annotation = ann
+                for _ in range(sequence_depth):
+                    capture_annotation = list[capture_annotation]
                 rows.append(
                     {
                         "key": key,
                         "defining": _defining_class(cls, fname),
-                        "annotation": ann,
-                        "kind": derive_kind(ann, normalized),
+                        "annotation": capture_annotation,
+                        "kind": derive_kind(capture_annotation, normalized),
                         "converter": str(normalized.get("converter", "")),
                         "allowed": _domain_values(ann, normalized),
                         "metadata": normalized,
                     }
                 )
             if not _is_explicit_exclude(meta):
-                for sub in _nested_models(ann):
-                    walk(sub, key, (*stack, cls))
+                for sub, depth in _nested_models(ann):
+                    walk(sub, key, (*stack, cls), sequence_depth + depth)
 
     walk(model_cls, "", ())
 
@@ -534,26 +534,26 @@ def _schema_digest(model_cls: type[BaseModel]) -> str:
 
 
 def _resolve_path(instance: BaseModel, path: str) -> tuple[bool, Any]:
-    """Resolve a dotted manifest path against a live instance.
+    """Resolve only declared model fields, preserving positions through model lists.
 
-    Returns (present, value). Skips when a parent segment is missing/None or is
-    not a pydantic model (unset config, or a discriminated-union arm that isn't
-    the active one). A present leaf whose value is None resolves as (True, None).
+    Missing fields in inactive union arms occupy null positions. The manifest's
+    sequence annotation makes the regular sanitizer validate and bound every item.
     """
     segments = path.split(".")
-    obj: Any = instance
-    for seg in segments[:-1]:
-        if not _is_pydantic_model(obj):
+
+    def resolve(obj: Any, offset: int) -> tuple[bool, Any]:
+        if offset == len(segments):
+            return True, obj
+        if isinstance(obj, (list, tuple, set)):
+            values = [resolve(item, offset)[1] for item in obj]
+            if isinstance(obj, set):
+                values.sort(key=_canonical_json)
+            return True, values
+        if not _is_pydantic_model(obj) or segments[offset] not in obj.__class__.model_fields:
             return False, None
-        if seg not in obj.__class__.model_fields:
-            return False, None
-        obj = getattr(obj, seg, None)
-        if obj is None:
-            return False, None
-    leaf = segments[-1]
-    if not _is_pydantic_model(obj) or leaf not in obj.__class__.model_fields:
-        return False, None
-    return True, getattr(obj, leaf, None)
+        return resolve(getattr(obj, segments[offset], None), offset + 1)
+
+    return resolve(instance, 0)
 
 
 def _truncate_to_budget(values: dict[str, Any]) -> tuple[dict[str, Any], str]:

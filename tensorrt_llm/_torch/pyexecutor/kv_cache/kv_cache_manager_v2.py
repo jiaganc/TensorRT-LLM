@@ -1363,7 +1363,9 @@ class KVCacheManagerV2(BaseResourceManager):
             if candidate is not None:
                 candidate.shutdown()
             if init_error is not None:
-                init_error.add_note(f"Initializing {manager_identity}")
+                logger.error(f"Initializing {manager_identity}: {init_error}")
+                if sys.version_info >= (3, 11):
+                    init_error.add_note(f"Initializing {manager_identity}")
                 raise init_error
             raise RuntimeError(f"{manager_identity} initialization failed on another rank")
 
@@ -1404,7 +1406,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 if candidate is not None:
                     candidate.shutdown()
                 if fallback_error is not None:
-                    fallback_error.add_note(f"Initializing {manager_identity} without host tier")
+                    logger.error(
+                        f"Initializing {manager_identity} without host tier: {fallback_error}"
+                    )
+                    if sys.version_info >= (3, 11):
+                        fallback_error.add_note(
+                            f"Initializing {manager_identity} without host tier"
+                        )
                     raise fallback_error
                 raise RuntimeError(
                     f"{manager_identity} initialization without host tier failed on another rank"

@@ -2053,8 +2053,10 @@ def test_expect_snapshot_points_binding_round_trip():
 
 
 @skip_no_cuda
-def test_v2_hybrid_pool_ratio_controls_allocated_memory():
+@pytest.mark.parametrize("window_size", [None, 128])
+def test_v2_hybrid_pool_ratio_controls_allocated_memory(window_size):
     init_cuda_once()
+    attention_type = "full_attention" if window_size is None else "swa"
 
     def allocated_memory(pool_ratio, descriptors=False):
         mgr = object.__new__(MambaHybridCacheManagerV2)
@@ -2086,7 +2088,7 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
             pool_ratio=None if descriptors else pool_ratio,
             pool_ratio_descriptors=[
                 {"match": {"type": kind}, "ratio": ratio}
-                for kind, ratio in zip(["ssm", "swa"], pool_ratio)
+                for kind, ratio in zip(["ssm", attention_type], pool_ratio)
             ]
             if descriptors
             else None,
@@ -2097,11 +2099,18 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         base_config = KVCacheManagerConfig(
             tokens_per_block=32,
             cache_tiers=[GpuCacheTierConfig(quota=64 << 20)],
-            layers=_base_attention_layer_configs(2),
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(i),
+                    buffers=[BufferConfig(role="key", size=256)],
+                    sliding_window_size=window_size,
+                )
+                for i in range(2)
+            ],
             initial_pool_ratio=None if descriptors else pool_ratio,
             initial_pool_ratio_descriptors=[
                 PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType[kind.upper()]), ratio)
-                for kind, ratio in zip(["ssm", "swa"], pool_ratio)
+                for kind, ratio in zip(["ssm", attention_type], pool_ratio)
             ]
             if descriptors
             else None,

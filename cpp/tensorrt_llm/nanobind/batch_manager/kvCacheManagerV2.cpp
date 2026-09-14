@@ -1621,20 +1621,35 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         }
         return nb::cast<int>(value);
     };
+    auto strictSelectorType = [](nb::handle value) -> std::optional<kv::LayerType>
+    {
+        if (value.is_none())
+        {
+            return std::nullopt;
+        }
+        if (!nb::isinstance(value, nb::type<kv::LayerType>()))
+        {
+            throw nb::value_error("type must be a LayerType");
+        }
+        return nb::cast<kv::LayerType>(value);
+    };
     nb::class_<kv::LayerGroupMatch>(m, "LayerGroupMatch")
         .def(
             "__init__",
-            [strictSelectorInteger](kv::LayerGroupMatch* self, std::optional<kv::LayerType> type,
+            [strictSelectorInteger, strictSelectorType](kv::LayerGroupMatch* self, nb::object type,
                 bool windowSizeSpecified, nb::object windowSize, nb::object sinkBlocks)
             {
-                kv::LayerGroupMatch value{std::move(type), windowSizeSpecified, strictSelectorInteger(windowSize),
-                    strictSelectorInteger(sinkBlocks)};
+                kv::LayerGroupMatch value{strictSelectorType(type), windowSizeSpecified,
+                    strictSelectorInteger(windowSize), strictSelectorInteger(sinkBlocks)};
                 value.validate();
                 new (self) kv::LayerGroupMatch(std::move(value));
             },
-            nb::arg("type").none() = std::nullopt, nb::arg("window_size_specified").noconvert() = false,
+            nb::arg("type").none() = nb::none(), nb::arg("window_size_specified").noconvert() = false,
             nb::arg("window_size").none() = nb::none(), nb::arg("sink_blocks").none() = nb::none())
-        .def_rw("type", &kv::LayerGroupMatch::type)
+        .def_prop_rw(
+            "type", [](kv::LayerGroupMatch const& self) { return self.type; },
+            [strictSelectorType](kv::LayerGroupMatch& self, nb::object value)
+            { self.type = strictSelectorType(value); })
         .def_rw("window_size_specified", &kv::LayerGroupMatch::windowSizeSpecified)
         .def_prop_rw(
             "window_size", [](kv::LayerGroupMatch const& self) { return self.windowSize; },

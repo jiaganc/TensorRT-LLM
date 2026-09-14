@@ -1624,7 +1624,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::LayerGroupMatch>(m, "LayerGroupMatch")
         .def(
             "__init__",
-            [strictSelectorInteger](kv::LayerGroupMatch* self, std::optional<std::string> type,
+            [strictSelectorInteger](kv::LayerGroupMatch* self, std::optional<kv::LayerType> type,
                 bool windowSizeSpecified, nb::object windowSize, nb::object sinkBlocks)
             {
                 kv::LayerGroupMatch value{std::move(type), windowSizeSpecified, strictSelectorInteger(windowSize),

@@ -50,6 +50,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         LayerGroupId,
         LayerGroupMatch,
         LayerId,
+        LayerType,
         PlannedDropHandle,
         PoolRatioDescriptor,
         ReuseScope,
@@ -106,6 +107,7 @@ else:
         LayerGroupId,
         LayerGroupMatch,
         LayerId,
+        LayerType,
         PlannedDropHandle,
         PoolRatioDescriptor,
         ReuseScope,
@@ -3373,7 +3375,12 @@ class TestPoolRatioDescriptors(unittest.TestCase):
         init_cuda_once()
         self.config = TestInitRatioConfig()._make_config()
         self.entries = [
-            PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True, window_size=128), 0.25),
+            PoolRatioDescriptor(
+                LayerGroupMatch(
+                    type=LayerType.ATTENTION, window_size_specified=True, window_size=128
+                ),
+                0.25,
+            ),
             PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 0.75),
         ]
 
@@ -3402,6 +3409,8 @@ class TestPoolRatioDescriptors(unittest.TestCase):
                     self.assertTrue(
                         actual.initial_pool_ratio_descriptors[0].match.window_size_specified
                     )
+        self.assertEqual(replace(self.entries[0].match).type, LayerType.ATTENTION)
+        self.assertEqual(deepcopy(self.entries[0]).match.type, LayerType.ATTENTION)
         self.assertEqual(replace(self.entries[0].match).window_size, 128)
         self.assertIsNone(deepcopy(self.entries[1]).match.window_size)
 
@@ -3458,14 +3467,14 @@ class TestPoolRatioDescriptors(unittest.TestCase):
                 "matches no layer groups",
             ),
             (
-                [PoolRatioDescriptor(LayerGroupMatch(type="attention"), 1.0)],
+                [PoolRatioDescriptor(LayerGroupMatch(type=LayerType.ATTENTION), 1.0)],
                 "matches 2 layer groups",
             ),
             ([PoolRatioDescriptor(LayerGroupMatch(), 1.0)], "matches 2 layer groups"),
             (
                 [
                     PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 0.5),
-                    PoolRatioDescriptor(LayerGroupMatch(type="attention"), 0.5),
+                    PoolRatioDescriptor(LayerGroupMatch(type=LayerType.ATTENTION), 0.5),
                 ],
                 "matches 2 layer groups",
             ),
@@ -3520,8 +3529,8 @@ class TestPoolRatioDescriptors(unittest.TestCase):
     def test_ssm_does_not_match_attention_properties(self):
         config = TestInitRatioConfig()._make_hybrid_config()
         entries = [
-            PoolRatioDescriptor(LayerGroupMatch(type="ssm"), 0.75),
-            PoolRatioDescriptor(LayerGroupMatch(type="attention"), 0.25),
+            PoolRatioDescriptor(LayerGroupMatch(type=LayerType.SSM), 0.75),
+            PoolRatioDescriptor(LayerGroupMatch(type=LayerType.ATTENTION), 0.25),
         ]
         self.assertEqual(
             self.allocation(replace(config, initial_pool_ratio=[0.75, 0.25])),
@@ -3557,7 +3566,11 @@ class TestPoolRatioDescriptors(unittest.TestCase):
             dict(window_size_specified=True, window_size=True),
             dict(sink_blocks="0"),
             dict(sink_blocks=-1),
-            dict(type="ssm", window_size_specified=True),
+            dict(type=LayerType.SSM, window_size_specified=True),
+            dict(type="attention"),
+            dict(type="ssm"),
+            dict(type=0),
+            dict(type=True),
         ]:
             with self.subTest(kwargs=kwargs), self.assertRaises((ValueError, TypeError)):
                 LayerGroupMatch(**kwargs)

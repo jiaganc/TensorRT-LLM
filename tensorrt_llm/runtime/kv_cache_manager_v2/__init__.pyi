@@ -23,7 +23,6 @@ from typing import (
     Final,
     Iterable,
     Iterator,
-    Literal,
     NamedTuple,
     NewType,
     Protocol,
@@ -179,9 +178,13 @@ class BatchDesc:
 class SwaScratchReuseConfig:
     max_rewind_len: int = 0
 
+class LayerType(enum.Enum):
+    ATTENTION = 0
+    SSM = 1
+
 @dataclass
 class LayerGroupMatch:
-    type: Literal["attention", "ssm"] | None = None
+    type: LayerType | None = None
     window_size_specified: bool = False
     window_size: int | None = None
     sink_blocks: int | None = None

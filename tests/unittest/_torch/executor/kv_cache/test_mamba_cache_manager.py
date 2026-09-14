@@ -79,6 +79,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     LayerId,
+    LayerType,
     SsmLayerConfig,
     _introspection,
 )
@@ -2099,7 +2100,7 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
             layers=_base_attention_layer_configs(2),
             initial_pool_ratio=None if descriptors else pool_ratio,
             initial_pool_ratio_descriptors=[
-                PoolRatioDescriptor(LayerGroupMatch(type=kind), ratio)
+                PoolRatioDescriptor(LayerGroupMatch(type=LayerType[kind.upper()]), ratio)
                 for kind, ratio in zip(["ssm", "attention"], pool_ratio)
             ]
             if descriptors

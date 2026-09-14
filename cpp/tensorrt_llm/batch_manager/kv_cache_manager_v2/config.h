@@ -261,7 +261,7 @@ struct SwaScratchReuseConfig
 //! Partial lifecycle selector. Presence is independent of a null (full-attention) window.
 struct LayerGroupMatch
 {
-    std::optional<std::string> type;
+    std::optional<LayerType> type;
     bool windowSizeSpecified = false;
     std::optional<int> windowSize;
     std::optional<int> sinkBlocks;

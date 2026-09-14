@@ -21,7 +21,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import ClassVar, Literal, NewType, Protocol
+from typing import ClassVar, NewType, Protocol
 
 from ._common import CacheTier, LayerId
 
@@ -183,14 +183,14 @@ class SwaScratchReuseConfig:
 class LayerGroupMatch:
     """Runtime selector; window_size_specified distinguishes wildcard from full attention."""
 
-    type: Literal["attention", "ssm"] | None = None
+    type: LayerType | None = None
     window_size_specified: bool = False
     window_size: int | None = None
     sink_blocks: int | None = None
 
     def validate(self) -> None:
-        if self.type not in (None, "attention", "ssm"):
-            raise ValueError("type must be attention or ssm")
+        if self.type is not None and not isinstance(self.type, LayerType):
+            raise ValueError("type must be a LayerType")
         if type(self.window_size_specified) is not bool:
             raise ValueError("window_size_specified must be a boolean")
         if self.window_size is not None and (
@@ -203,7 +203,9 @@ class LayerGroupMatch:
             type(self.sink_blocks) is not int or self.sink_blocks < 0
         ):
             raise ValueError("sink_blocks must be a nonnegative integer")
-        if self.type == "ssm" and (self.window_size_specified or self.sink_blocks is not None):
+        if self.type == LayerType.SSM and (
+            self.window_size_specified or self.sink_blocks is not None
+        ):
             raise ValueError("SSM selectors cannot specify window_size or sink_blocks")
 
     def __post_init__(self) -> None:

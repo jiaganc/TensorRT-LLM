@@ -106,7 +106,7 @@ std::string describeSelector(LayerGroupMatch const& selector)
     std::vector<std::string> fields;
     if (selector.type)
     {
-        fields.push_back("type: " + *selector.type);
+        fields.push_back(selector.type == LayerType::ATTENTION ? "type: attention" : "type: ssm");
     }
     if (selector.windowSizeSpecified)
     {
@@ -131,8 +131,9 @@ std::string describeSelector(LayerGroupMatch const& selector)
 bool matchesSelector(LayerGroupMatch const& selector, LayerGroupMatch const& group)
 {
     return (!selector.type || selector.type == group.type)
-        && (!selector.windowSizeSpecified || (group.type == "attention" && selector.windowSize == group.windowSize))
-        && (!selector.sinkBlocks || (group.type == "attention" && selector.sinkBlocks == group.sinkBlocks));
+        && (!selector.windowSizeSpecified
+            || (group.type == LayerType::ATTENTION && selector.windowSize == group.windowSize))
+        && (!selector.sinkBlocks || (group.type == LayerType::ATTENTION && selector.sinkBlocks == group.sinkBlocks));
 }
 
 std::optional<std::vector<float>> resolvePoolRatios(
@@ -158,11 +159,11 @@ std::optional<std::vector<float>> resolvePoolRatios(
         LayerGroupMatch group;
         if (auto const* attn = std::get_if<AttnLifeCycle>(&lifecycle))
         {
-            group = {"attention", true, attn->windowSize, attn->numSinkBlocks};
+            group = {LayerType::ATTENTION, true, attn->windowSize, attn->numSinkBlocks};
         }
         else
         {
-            group.type = "ssm";
+            group.type = LayerType::SSM;
         }
         catalog.push_back(group);
         available += "\n  " + describeSelector(group);

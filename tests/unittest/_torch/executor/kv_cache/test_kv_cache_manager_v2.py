@@ -1716,7 +1716,7 @@ def test_descriptor_failure_consumes_explicit_native_codec():
             )
         ],
         initial_pool_ratio_descriptors=[
-            runtime.PoolRatioDescriptor(runtime.LayerGroupMatch(type="ssm"), 1.0)
+            runtime.PoolRatioDescriptor(runtime.LayerGroupMatch(type=runtime.LayerType.SSM), 1.0)
         ],
     )
     codec = runtime.create_default_kv_cache_cold_page_codec()

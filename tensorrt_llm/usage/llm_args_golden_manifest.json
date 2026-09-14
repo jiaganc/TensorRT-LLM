@@ -968,10 +968,11 @@
     },
     {
       "allowed_values": [
-        "attention",
+        "full_attention",
+        "swa",
         "ssm"
       ],
-      "annotation": "list[Optional[Literal['attention', 'ssm']]]",
+      "annotation": "list[Optional[Literal['full_attention', 'swa', 'ssm']]]",
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.pool_ratio_descriptors.match.type"

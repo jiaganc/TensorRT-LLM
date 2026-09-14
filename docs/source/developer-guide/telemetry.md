@@ -157,7 +157,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.max_util_for_resume` | `<class 'float'>` | `value` |  |  |
 | `kv_cache_config.pool_ratio` | `Optional[List[float]]` | `value` |  |  |
 | `kv_cache_config.pool_ratio_descriptors.match.sink_blocks` | `list[Optional[Annotated[int, FieldInfo(annotation=NoneType, required=True, metadata=[Strict(strict=True), Ge(ge=0)])]]]` | `value` |  |  |
-| `kv_cache_config.pool_ratio_descriptors.match.type` | `list[Optional[Literal['attention', 'ssm']]]` | `value` |  | `attention`, `ssm` |
+| `kv_cache_config.pool_ratio_descriptors.match.type` | `list[Optional[Literal['full_attention', 'swa', 'ssm']]]` | `value` |  | `full_attention`, `swa`, `ssm` |
 | `kv_cache_config.pool_ratio_descriptors.match.window_size` | `list[Optional[Annotated[int, FieldInfo(annotation=NoneType, required=True, metadata=[Strict(strict=True), Gt(gt=0)])]]]` | `value` |  |  |
 | `kv_cache_config.pool_ratio_descriptors.ratio` | `list[float]` | `value` |  |  |
 | `kv_cache_config.secondary_offload_min_priority` | `Optional[int]` | `value` |  |  |

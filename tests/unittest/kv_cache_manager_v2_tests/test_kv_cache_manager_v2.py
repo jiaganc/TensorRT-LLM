@@ -3496,15 +3496,11 @@ class TestPoolRatioDescriptors(unittest.TestCase):
                 [PoolRatioDescriptor(LayerGroupMatch(window_size=8), 1.0)],
                 "matches no layer groups",
             ),
-            (
-                [PoolRatioDescriptor(LayerGroupMatch(sink_blocks=0), 1.0)],
-                "matches 2 layer groups",
-            ),
             ([PoolRatioDescriptor(LayerGroupMatch(), 1.0)], "matches 2 layer groups"),
             (
                 [
                     PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.FULL_ATTENTION), 0.5),
-                    PoolRatioDescriptor(LayerGroupMatch(sink_blocks=0), 0.5),
+                    PoolRatioDescriptor(LayerGroupMatch(), 0.5),
                 ],
                 "matches 2 layer groups",
             ),

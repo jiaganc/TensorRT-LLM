@@ -4524,9 +4524,12 @@ class TestDeepseekRuntimePreferences:
 
 
 @pytest.mark.parametrize("selector", [{}, {
-    "type": "attention"
+    "type": "swa"
 }, {
-    "window_size": None
+    "type": "swa",
+    "window_size": 128
+}, {
+    "type": "full_attention"
 }, {
     "window_size": 128,
     "sink_blocks": 0
@@ -4659,6 +4662,32 @@ def test_KvCacheConfig_descriptor_round_trip(selector):
         },
         "ratio": 1.0
     },
+    {
+        "match": {
+            "type": "attention"
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "window_size": None
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "type": "full_attention",
+            "window_size": 128
+        },
+        "ratio": 1.0
+    },
+    {
+        "match": {
+            "type": "ssm",
+            "window_size": 128
+        },
+        "ratio": 1.0
+    },
 ])
 def test_KvCacheConfig_descriptor_invalid_entries(entry):
     with pytest.raises(ValidationError):
@@ -4690,6 +4719,8 @@ def test_KvCacheConfig_descriptor_schema_and_exclusion():
     assert new["default"] is None and new["status"] == "prototype"
     assert schema["$defs"]["KvCacheLayerGroupMatchConfig"][
         "additionalProperties"] is False
+    assert schema["$defs"]["KvCacheLayerGroupMatchConfig"]["properties"][
+        "type"]["anyOf"][0]["enum"] == ["full_attention", "swa", "ssm"]
 
 
 def test_KvCacheConfig_descriptor_cli_merge():
@@ -4698,7 +4729,7 @@ def test_KvCacheConfig_descriptor_cli_merge():
         "kv_cache_config": {
             "pool_ratio_descriptors": [{
                 "match": {
-                    "type": "attention"
+                    "type": "swa"
                 },
                 "ratio": 1.0
             }]

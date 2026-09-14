@@ -68,8 +68,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerGroupMatch,
+    LayerGroupType,
     LayerId,
-    LayerType,
     LifeCycleId,
     PageIndexMode,
     PlannedDropHandle,
@@ -2296,10 +2296,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 [
                     PoolRatioDescriptor(
                         match=LayerGroupMatch(
-                            type=LayerType[entry.match.type.upper()]
+                            type=LayerGroupType[entry.match.type.upper()]
                             if entry.match.type is not None
                             else None,
-                            window_size_specified="window_size" in entry.match.model_fields_set,
                             window_size=entry.match.window_size,
                             sink_blocks=entry.match.sink_blocks,
                         ),

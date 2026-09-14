@@ -179,32 +179,37 @@ class SwaScratchReuseConfig:
         assert self.max_rewind_len >= 0, "max_rewind_len must be non-negative"
 
 
+class LayerGroupType(IntEnum):
+    """Lifecycle kinds available to pool-ratio selectors."""
+
+    FULL_ATTENTION = 0
+    SWA = 1
+    SSM = 2
+
+
 @dataclass(slots=True)
 class LayerGroupMatch:
-    """Runtime selector; window_size_specified distinguishes wildcard from full attention."""
+    """Partial lifecycle selector; omitted properties impose no restriction."""
 
-    type: LayerType | None = None
-    window_size_specified: bool = False
+    type: LayerGroupType | None = None
     window_size: int | None = None
     sink_blocks: int | None = None
 
     def validate(self) -> None:
-        if self.type is not None and not isinstance(self.type, LayerType):
-            raise ValueError("type must be a LayerType")
-        if type(self.window_size_specified) is not bool:
-            raise ValueError("window_size_specified must be a boolean")
+        if self.type is not None and not isinstance(self.type, LayerGroupType):
+            raise ValueError("type must be a LayerGroupType")
         if self.window_size is not None and (
-            type(self.window_size) is not int
-            or self.window_size <= 0
-            or not self.window_size_specified
+            type(self.window_size) is not int or self.window_size <= 0
         ):
-            raise ValueError("window_size must be positive and window_size_specified must be true")
+            raise ValueError("window_size must be positive")
+        if self.type == LayerGroupType.FULL_ATTENTION and self.window_size is not None:
+            raise ValueError("full_attention selectors cannot specify window_size")
         if self.sink_blocks is not None and (
             type(self.sink_blocks) is not int or self.sink_blocks < 0
         ):
             raise ValueError("sink_blocks must be a nonnegative integer")
-        if self.type == LayerType.SSM and (
-            self.window_size_specified or self.sink_blocks is not None
+        if self.type == LayerGroupType.SSM and (
+            self.window_size is not None or self.sink_blocks is not None
         ):
             raise ValueError("SSM selectors cannot specify window_size or sink_blocks")
 

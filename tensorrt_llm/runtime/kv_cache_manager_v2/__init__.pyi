@@ -178,14 +178,14 @@ class BatchDesc:
 class SwaScratchReuseConfig:
     max_rewind_len: int = 0
 
-class LayerType(enum.Enum):
-    ATTENTION = 0
-    SSM = 1
+class LayerGroupType(enum.Enum):
+    FULL_ATTENTION = 0
+    SWA = 1
+    SSM = 2
 
 @dataclass
 class LayerGroupMatch:
-    type: LayerType | None = None
-    window_size_specified: bool = False
+    type: LayerGroupType | None = None
     window_size: int | None = None
     sink_blocks: int | None = None
     def validate(self) -> None: ...

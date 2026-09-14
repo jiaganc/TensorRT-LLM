@@ -258,11 +258,18 @@ struct SwaScratchReuseConfig
 // Top-level KV cache manager configuration (mirrors _config.py::KVCacheManagerConfig).
 // ---------------------------------------------------------------------------
 
-//! Partial lifecycle selector. Presence is independent of a null (full-attention) window.
+//! Lifecycle kinds available to pool-ratio selectors.
+enum class LayerGroupType
+{
+    kFullAttention,
+    kSwa,
+    kSsm,
+};
+
+//! Partial lifecycle selector. Omitted properties impose no restriction.
 struct LayerGroupMatch
 {
-    std::optional<LayerType> type;
-    bool windowSizeSpecified = false;
+    std::optional<LayerGroupType> type;
     std::optional<int> windowSize;
     std::optional<int> sinkBlocks;
 

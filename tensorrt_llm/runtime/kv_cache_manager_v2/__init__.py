@@ -62,7 +62,7 @@ if _BACKEND == "python":
         KVCacheDesc,
         KVCacheManagerConfig,
         LayerGroupMatch,
-        LayerType,
+        LayerGroupType,
         PoolRatioDescriptor,
         SsmLayerConfig,
         SwaScratchReuseConfig,
@@ -177,7 +177,7 @@ else:
     KVCacheManager = _cpp.KVCacheManager
     KVCacheManagerConfig = _cpp.KVCacheManagerConfig
     LayerGroupMatch = _cpp.LayerGroupMatch
-    LayerType = _cpp.LayerType
+    LayerGroupType = _cpp.LayerGroupType
     PoolRatioDescriptor = _cpp.PoolRatioDescriptor
     IKvCacheColdPageCodec = _cpp.IKvCacheColdPageCodec
     create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page_codec
@@ -214,8 +214,7 @@ else:
 
     @_dataclasses.dataclass
     class _LayerGroupMatchFieldSpec:
-        type: LayerType | None = None
-        window_size_specified: bool = False
+        type: LayerGroupType | None = None
         window_size: object = None
         sink_blocks: object = None
 
@@ -352,7 +351,7 @@ __all__ = [
     "KVCacheManager",
     "KVCacheManagerConfig",
     "LayerGroupMatch",
-    "LayerType",
+    "LayerGroupType",
     "PoolRatioDescriptor",
     "KVCacheRemovedData",
     "KVCacheStoredBlockData",

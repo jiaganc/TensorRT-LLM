@@ -163,36 +163,40 @@ For example, for a manager with these three effective attention windows:
 ```yaml
 kv_cache_config:
   pool_ratio_descriptors:
-    - match: {window_size: null}
+    - match: {type: full_attention}
       ratio: 0.22
-    - match: {window_size: 128}
+    - match: {type: swa, window_size: 128}
       ratio: 0.55
-    - match: {window_size: 8}
+    - match: {type: swa, window_size: 8}
       ratio: 0.23
 ```
 
 These windows and shares are illustrative, not a recommended model tuning.
-For a hybrid manager with exactly one attention group and one SSM group, use
-`match: {type: attention}` and `match: {type: ssm}` with the desired shares.
+For a hybrid manager with exactly one full-attention group and one SSM group, use
+`match: {type: full_attention}` and `match: {type: ssm}` with the desired shares.
+Use `type: swa` for a sliding-window group. A type-only SWA selector is valid when
+the manager has exactly one SWA group; otherwise add a window or sink count.
 
 The prototype selector fields are:
 
 | Property | When supplied | When omitted |
 | --- | --- | --- |
-| `type` | Exactly `attention` or `ssm`; null is invalid | Either lifecycle type |
-| `window_size` | Positive integer in effective runtime token units; null means full attention | Any window |
+| `type` | Exactly `full_attention`, `swa`, or `ssm`; null is invalid | Any lifecycle type |
+| `window_size` | Positive SWA window in effective runtime token units; null is invalid | No window restriction |
 | `sink_blocks` | Nonnegative integer after sink tokens are rounded up by `tokens_per_block`; null is invalid | Any sink count |
 
-Window and sink properties apply only to attention. Combining either with
-`type: ssm` is invalid. Booleans and numeric strings are not selector integers.
-Omission remains a wildcard through configuration serialization; explicit null
-for `window_size` remains a full-attention predicate.
+The window property applies only to SWA; combining it with `type: full_attention`
+or `type: ssm` is invalid. A window supplied without a type matches SWA groups with
+that exact window. Sink counts apply to both attention types, but not to SSM.
+Booleans and numeric strings are not selector integers. Omission remains a
+wildcard through configuration serialization. Use `type: full_attention` instead
+of the earlier prototype's `window_size: null` selector, which is now rejected.
 
 Each required `match` is evaluated independently against the manager's complete
 catalog. It must identify exactly one group, and every group must receive one
 share. Ratios must be finite, positive, and sum to 1.0 within `1e-6`. There is no
 remainder allocation or order-based tie breaking. `match: {}` works only for a
-single-group manager. A broad attention selector remains ambiguous even if a
+single-group manager. A broad SWA selector remains ambiguous even if a
 second entry identifies one of its candidates. Errors report the selectors,
 matching/available groups, and distinguishing properties; for example, two
 attention groups with the same window may require `sink_blocks`.

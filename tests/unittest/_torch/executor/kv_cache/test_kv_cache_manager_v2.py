@@ -53,6 +53,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     HostCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
+    LayerGroupType,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
@@ -1567,9 +1568,10 @@ def test_descriptor_constructor_error_is_coordinated(host_bytes):
 
 
 def test_descriptor_transport_and_copy_conflict():
-    descriptors = [{"match": {"type": "attention"}, "ratio": 1.0}]
+    descriptors = [{"match": {"type": "swa"}, "ratio": 1.0}]
     public = KvCacheConfig(
         pool_ratio_descriptors=descriptors,
+        max_attention_window=[128],
         avg_seq_len=8192,
         max_gpu_total_bytes=16 << 20,
         host_cache_size=0,
@@ -1595,7 +1597,8 @@ def test_descriptor_transport_and_copy_conflict():
         config = manager.kv_cache_manager_py_config
         assert config.initial_pool_ratio is None
         assert config.typical_step is None
-        assert not config.initial_pool_ratio_descriptors[0].match.window_size_specified
+        assert config.initial_pool_ratio_descriptors[0].match.type == LayerGroupType.SWA
+        assert config.initial_pool_ratio_descriptors[0].match.window_size is None
     finally:
         manager.shutdown()
     assert public.model_dump()["pool_ratio_descriptors"] == descriptors
@@ -1682,7 +1685,7 @@ def test_descriptor_mismatch_on_one_rank_aborts_all_ranks():
 
 def test_host_fallback_preserves_unresolved_descriptors():
     public = KvCacheConfig(
-        pool_ratio_descriptors=[{"match": {"window_size": None}, "ratio": 1.0}],
+        pool_ratio_descriptors=[{"match": {"type": "full_attention"}, "ratio": 1.0}],
         max_gpu_total_bytes=16 << 20,
         host_cache_size=16 << 20,
     )
@@ -1695,7 +1698,10 @@ def test_host_fallback_preserves_unresolved_descriptors():
         for call in constructor.call_args_list:
             transported = call.args[0]
             assert transported.initial_pool_ratio is None
-            assert transported.initial_pool_ratio_descriptors[0].match.window_size_specified
+            assert (
+                transported.initial_pool_ratio_descriptors[0].match.type
+                == LayerGroupType.FULL_ATTENTION
+            )
             assert transported.initial_pool_ratio_descriptors[0].match.window_size is None
     finally:
         manager.shutdown()
@@ -1716,7 +1722,9 @@ def test_descriptor_failure_consumes_explicit_native_codec():
             )
         ],
         initial_pool_ratio_descriptors=[
-            runtime.PoolRatioDescriptor(runtime.LayerGroupMatch(type=runtime.LayerType.SSM), 1.0)
+            runtime.PoolRatioDescriptor(
+                runtime.LayerGroupMatch(type=runtime.LayerGroupType.SSM), 1.0
+            )
         ],
     )
     codec = runtime.create_default_kv_cache_cold_page_codec()

@@ -78,8 +78,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GpuCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
+    LayerGroupType,
     LayerId,
-    LayerType,
     SsmLayerConfig,
     _introspection,
 )
@@ -2086,7 +2086,7 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
             pool_ratio=None if descriptors else pool_ratio,
             pool_ratio_descriptors=[
                 {"match": {"type": kind}, "ratio": ratio}
-                for kind, ratio in zip(["ssm", "attention"], pool_ratio)
+                for kind, ratio in zip(["ssm", "swa"], pool_ratio)
             ]
             if descriptors
             else None,
@@ -2100,8 +2100,8 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
             layers=_base_attention_layer_configs(2),
             initial_pool_ratio=None if descriptors else pool_ratio,
             initial_pool_ratio_descriptors=[
-                PoolRatioDescriptor(LayerGroupMatch(type=LayerType[kind.upper()]), ratio)
-                for kind, ratio in zip(["ssm", "attention"], pool_ratio)
+                PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType[kind.upper()]), ratio)
+                for kind, ratio in zip(["ssm", "swa"], pool_ratio)
             ]
             if descriptors
             else None,

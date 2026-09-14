@@ -4,7 +4,7 @@
 import logging
 import warnings
 
-from ._config import KVCacheManagerConfig, LayerGroupMatch, LayerType
+from ._config import KVCacheManagerConfig, LayerGroupMatch, LayerGroupType
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleRegistry
 
 
@@ -12,9 +12,8 @@ def _describe(selector: LayerGroupMatch) -> str:
     fields = []
     if selector.type is not None:
         fields.append(f"type: {selector.type.name.lower()}")
-    if selector.window_size_specified:
-        window = "null" if selector.window_size is None else str(selector.window_size)
-        fields.append(f"window_size: {window}")
+    if selector.window_size is not None:
+        fields.append(f"window_size: {selector.window_size}")
     if selector.sink_blocks is not None:
         fields.append(f"sink_blocks: {selector.sink_blocks}")
     return "{" + ", ".join(fields) + "}"
@@ -23,21 +22,25 @@ def _describe(selector: LayerGroupMatch) -> str:
 def _descriptor(lifecycle: LifeCycle) -> LayerGroupMatch:
     if isinstance(lifecycle, AttnLifeCycle):
         return LayerGroupMatch(
-            LayerType.ATTENTION, True, lifecycle.window_size, lifecycle.num_sink_blocks
+            LayerGroupType.SWA
+            if lifecycle.window_size is not None
+            else LayerGroupType.FULL_ATTENTION,
+            lifecycle.window_size,
+            lifecycle.num_sink_blocks,
         )
-    return LayerGroupMatch(LayerType.SSM)
+    return LayerGroupMatch(LayerGroupType.SSM)
 
 
 def _matches(selector: LayerGroupMatch, group: LayerGroupMatch) -> bool:
     return (
         (selector.type is None or selector.type == group.type)
         and (
-            not selector.window_size_specified
-            or (group.type == LayerType.ATTENTION and selector.window_size == group.window_size)
+            selector.window_size is None
+            or (group.type == LayerGroupType.SWA and selector.window_size == group.window_size)
         )
         and (
             selector.sink_blocks is None
-            or (group.type == LayerType.ATTENTION and selector.sink_blocks == group.sink_blocks)
+            or (group.type != LayerGroupType.SSM and selector.sink_blocks == group.sink_blocks)
         )
     )
 

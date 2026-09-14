@@ -40,19 +40,24 @@ void DiskCacheTierConfig::assertValid() const
 
 void LayerGroupMatch::validate() const
 {
-    if (type && *type != LayerType::ATTENTION && *type != LayerType::SSM)
+    if (type && *type != LayerGroupType::kFullAttention && *type != LayerGroupType::kSwa
+        && *type != LayerGroupType::kSsm)
     {
-        throw std::invalid_argument("type must be attention or ssm");
+        throw std::invalid_argument("type must be full_attention, swa, or ssm");
     }
-    if (windowSize && (!windowSizeSpecified || *windowSize <= 0))
+    if (windowSize && *windowSize <= 0)
     {
-        throw std::invalid_argument("window_size must be positive and window_size_specified must be true");
+        throw std::invalid_argument("window_size must be positive");
+    }
+    if (type == LayerGroupType::kFullAttention && windowSize)
+    {
+        throw std::invalid_argument("full_attention selectors cannot specify window_size");
     }
     if (sinkBlocks && *sinkBlocks < 0)
     {
         throw std::invalid_argument("sink_blocks must be a nonnegative integer");
     }
-    if (type == LayerType::SSM && (windowSizeSpecified || sinkBlocks))
+    if (type == LayerGroupType::kSsm && (windowSize || sinkBlocks))
     {
         throw std::invalid_argument("SSM selectors cannot specify window_size or sink_blocks");
     }

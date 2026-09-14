@@ -1621,36 +1621,40 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         }
         return nb::cast<int>(value);
     };
-    auto strictSelectorType = [](nb::handle value) -> std::optional<kv::LayerType>
+    nb::enum_<kv::LayerGroupType>(m, "LayerGroupType")
+        .value("FULL_ATTENTION", kv::LayerGroupType::kFullAttention)
+        .value("SWA", kv::LayerGroupType::kSwa)
+        .value("SSM", kv::LayerGroupType::kSsm);
+
+    auto strictSelectorType = [](nb::handle value) -> std::optional<kv::LayerGroupType>
     {
         if (value.is_none())
         {
             return std::nullopt;
         }
-        if (!nb::isinstance(value, nb::type<kv::LayerType>()))
+        if (!nb::isinstance(value, nb::type<kv::LayerGroupType>()))
         {
-            throw nb::value_error("type must be a LayerType");
+            throw nb::value_error("type must be a LayerGroupType");
         }
-        return nb::cast<kv::LayerType>(value);
+        return nb::cast<kv::LayerGroupType>(value);
     };
     nb::class_<kv::LayerGroupMatch>(m, "LayerGroupMatch")
         .def(
             "__init__",
-            [strictSelectorInteger, strictSelectorType](kv::LayerGroupMatch* self, nb::object type,
-                bool windowSizeSpecified, nb::object windowSize, nb::object sinkBlocks)
+            [strictSelectorInteger, strictSelectorType](
+                kv::LayerGroupMatch* self, nb::object type, nb::object windowSize, nb::object sinkBlocks)
             {
-                kv::LayerGroupMatch value{strictSelectorType(type), windowSizeSpecified,
-                    strictSelectorInteger(windowSize), strictSelectorInteger(sinkBlocks)};
+                kv::LayerGroupMatch value{
+                    strictSelectorType(type), strictSelectorInteger(windowSize), strictSelectorInteger(sinkBlocks)};
                 value.validate();
                 new (self) kv::LayerGroupMatch(std::move(value));
             },
-            nb::arg("type").none() = nb::none(), nb::arg("window_size_specified").noconvert() = false,
-            nb::arg("window_size").none() = nb::none(), nb::arg("sink_blocks").none() = nb::none())
+            nb::arg("type").none() = nb::none(), nb::arg("window_size").none() = nb::none(),
+            nb::arg("sink_blocks").none() = nb::none())
         .def_prop_rw(
             "type", [](kv::LayerGroupMatch const& self) { return self.type; },
             [strictSelectorType](kv::LayerGroupMatch& self, nb::object value)
             { self.type = strictSelectorType(value); })
-        .def_rw("window_size_specified", &kv::LayerGroupMatch::windowSizeSpecified)
         .def_prop_rw(
             "window_size", [](kv::LayerGroupMatch const& self) { return self.windowSize; },
             [strictSelectorInteger](kv::LayerGroupMatch& self, nb::object value)

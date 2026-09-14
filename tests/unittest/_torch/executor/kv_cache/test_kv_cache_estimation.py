@@ -1017,7 +1017,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(descriptors) -> None:
     kv_cache_config = KvCacheConfig(
         max_tokens=user_max_tokens,
         pool_ratio=None if descriptors else pool_ratio,
-        pool_ratio_descriptors=[{"match": {"window_size": None}, "ratio": 1.0}]
+        pool_ratio_descriptors=[{"match": {"type": "full_attention"}, "ratio": 1.0}]
         if descriptors
         else None,
         avg_seq_len=avg_seq_len,
@@ -1088,9 +1088,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(descriptors) -> None:
     assert creator._kv_cache_config.pool_ratio == (None if descriptors else pool_ratio)
     assert creator._kv_cache_config.pool_ratio_descriptors == kv_cache_config.pool_ratio_descriptors
     if descriptors:
-        assert creator._kv_cache_config.pool_ratio_descriptors[0].match.model_fields_set == {
-            "window_size"
-        }
+        assert creator._kv_cache_config.pool_ratio_descriptors[0].match.model_fields_set == {"type"}
     assert kv_cache_config.avg_seq_len == avg_seq_len
 
 

@@ -106,11 +106,16 @@ std::string describeSelector(LayerGroupMatch const& selector)
     std::vector<std::string> fields;
     if (selector.type)
     {
-        fields.push_back(selector.type == LayerType::ATTENTION ? "type: attention" : "type: ssm");
+        switch (*selector.type)
+        {
+        case LayerGroupType::kFullAttention: fields.push_back("type: full_attention"); break;
+        case LayerGroupType::kSwa: fields.push_back("type: swa"); break;
+        case LayerGroupType::kSsm: fields.push_back("type: ssm"); break;
+        }
     }
-    if (selector.windowSizeSpecified)
+    if (selector.windowSize)
     {
-        fields.push_back("window_size: " + (selector.windowSize ? std::to_string(*selector.windowSize) : "null"));
+        fields.push_back("window_size: " + std::to_string(*selector.windowSize));
     }
     if (selector.sinkBlocks)
     {
@@ -131,9 +136,8 @@ std::string describeSelector(LayerGroupMatch const& selector)
 bool matchesSelector(LayerGroupMatch const& selector, LayerGroupMatch const& group)
 {
     return (!selector.type || selector.type == group.type)
-        && (!selector.windowSizeSpecified
-            || (group.type == LayerType::ATTENTION && selector.windowSize == group.windowSize))
-        && (!selector.sinkBlocks || (group.type == LayerType::ATTENTION && selector.sinkBlocks == group.sinkBlocks));
+        && (!selector.windowSize || (group.type == LayerGroupType::kSwa && selector.windowSize == group.windowSize))
+        && (!selector.sinkBlocks || (group.type != LayerGroupType::kSsm && selector.sinkBlocks == group.sinkBlocks));
 }
 
 std::optional<std::vector<float>> resolvePoolRatios(
@@ -159,11 +163,12 @@ std::optional<std::vector<float>> resolvePoolRatios(
         LayerGroupMatch group;
         if (auto const* attn = std::get_if<AttnLifeCycle>(&lifecycle))
         {
-            group = {LayerType::ATTENTION, true, attn->windowSize, attn->numSinkBlocks};
+            group = {attn->windowSize ? LayerGroupType::kSwa : LayerGroupType::kFullAttention, attn->windowSize,
+                attn->numSinkBlocks};
         }
         else
         {
-            group.type = LayerType::SSM;
+            group.type = LayerGroupType::kSsm;
         }
         catalog.push_back(group);
         available += "\n  " + describeSelector(group);

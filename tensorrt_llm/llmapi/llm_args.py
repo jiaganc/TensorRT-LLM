@@ -4149,21 +4149,21 @@ class BlockReuseConfig(StrictBaseModel):
 class KvCacheLayerGroupMatchConfig(StrictBaseModel):
     """Prototype selector for one runtime KV-cache lifecycle group."""
 
-    type: Optional[Literal["attention", "ssm"]] = Field(
+    type: Optional[Literal["full_attention", "swa", "ssm"]] = Field(
         default=None,
         status="prototype",
         description=
-        "Exact lifecycle type. Omission matches either type; explicit null is invalid."
-    )
+        "Exact lifecycle type: full_attention, swa, or ssm. Omission matches any type; "
+        "explicit null is invalid.")
     window_size: Optional[Annotated[int, PydanticField(
         strict=True, gt=0
     )]] = Field(
         default=None,
         status="prototype",
         description=
-        "Effective attention window in runtime token units. Omission is a wildcard; "
-        "explicit null matches attention without a sliding window. Does not apply to SSM."
-    )
+        "Positive effective SWA window in runtime token units. Omission imposes no window restriction. "
+        "Use type='full_attention' for attention without a sliding window; explicit null is invalid. "
+        "Does not apply to full_attention or ssm.")
     sink_blocks: Optional[Annotated[int, PydanticField(
         strict=True, ge=0
     )]] = Field(
@@ -4174,17 +4174,21 @@ class KvCacheLayerGroupMatchConfig(StrictBaseModel):
         "Omission is a wildcard; explicit null is invalid. Does not apply to SSM."
     )
 
-    @field_validator('type', 'sink_blocks')
+    @field_validator('type', 'window_size', 'sink_blocks')
     @classmethod
     def reject_explicit_null(cls, value: str | int | None) -> str | int:
         if value is None:
             raise ValueError(
-                "Omit type or sink_blocks to match any value; explicit null is invalid"
+                "Omit selector properties to match any value; explicit null is invalid. "
+                "Use type='full_attention' for attention without a sliding window."
             )
         return value
 
     @model_validator(mode='after')
     def validate_applicability(self) -> "KvCacheLayerGroupMatchConfig":
+        if self.type == 'full_attention' and 'window_size' in self.model_fields_set:
+            raise ValueError(
+                "full_attention selectors cannot specify window_size")
         if self.type == 'ssm' and self.model_fields_set & {
                 'window_size', 'sink_blocks'
         }:

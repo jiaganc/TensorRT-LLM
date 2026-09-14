@@ -49,8 +49,8 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerGroupMatch,
+        LayerGroupType,
         LayerId,
-        LayerType,
         PlannedDropHandle,
         PoolRatioDescriptor,
         ReuseScope,
@@ -106,8 +106,8 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerGroupMatch,
+        LayerGroupType,
         LayerId,
-        LayerType,
         PlannedDropHandle,
         PoolRatioDescriptor,
         ReuseScope,
@@ -3376,12 +3376,10 @@ class TestPoolRatioDescriptors(unittest.TestCase):
         self.config = TestInitRatioConfig()._make_config()
         self.entries = [
             PoolRatioDescriptor(
-                LayerGroupMatch(
-                    type=LayerType.ATTENTION, window_size_specified=True, window_size=128
-                ),
+                LayerGroupMatch(type=LayerGroupType.SWA, window_size=128),
                 0.25,
             ),
-            PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 0.75),
+            PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.FULL_ATTENTION), 0.75),
         ]
 
     def allocation(self, config):
@@ -3406,13 +3404,49 @@ class TestPoolRatioDescriptors(unittest.TestCase):
                     actual = replace(cloned, layers=layers, initial_pool_ratio_descriptors=entries)
                     self.assertEqual(self.allocation(actual), expected)
                     self.assertIsNone(actual.initial_pool_ratio)
-                    self.assertTrue(
-                        actual.initial_pool_ratio_descriptors[0].match.window_size_specified
+                    self.assertIn(
+                        actual.initial_pool_ratio_descriptors[0].match.type,
+                        (LayerGroupType.SWA, LayerGroupType.FULL_ATTENTION),
                     )
-        self.assertEqual(replace(self.entries[0].match).type, LayerType.ATTENTION)
-        self.assertEqual(deepcopy(self.entries[0]).match.type, LayerType.ATTENTION)
+        self.assertEqual(replace(self.entries[0].match).type, LayerGroupType.SWA)
+        self.assertEqual(deepcopy(self.entries[0]).match.type, LayerGroupType.SWA)
         self.assertEqual(replace(self.entries[0].match).window_size, 128)
         self.assertIsNone(deepcopy(self.entries[1]).match.window_size)
+
+    def test_attention_types_and_swa_window_matching(self):
+        expected = self.allocation(replace(self.config, initial_pool_ratio=[0.25, 0.75]))
+        entries = [
+            PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.SWA), 0.25),
+            PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.FULL_ATTENTION), 0.75),
+        ]
+        self.assertEqual(
+            self.allocation(replace(self.config, initial_pool_ratio_descriptors=entries)), expected
+        )
+
+        config = replace(
+            self.config,
+            layers=[
+                *self.config.layers,
+                AttentionLayerConfig(
+                    layer_id=LayerId(2),
+                    buffers=self.config.layers[0].buffers,
+                    sliding_window_size=64,
+                ),
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "Specify window_size"):
+            KVCacheManager(replace(config, initial_pool_ratio_descriptors=entries))
+        entries = [
+            PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.SWA, window_size=128), 0.25),
+            PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.FULL_ATTENTION), 0.5),
+            PoolRatioDescriptor(LayerGroupMatch(window_size=64), 0.25),
+        ]
+        self.assertEqual(
+            self.allocation(
+                replace(config, initial_pool_ratio_descriptors=list(reversed(entries)))
+            ),
+            self.allocation(replace(config, initial_pool_ratio=[0.25, 0.5, 0.25])),
+        )
 
     def test_shared_hot_pool(self):
         layers = list(self.config.layers)
@@ -3459,31 +3493,27 @@ class TestPoolRatioDescriptors(unittest.TestCase):
     def test_matching_failures(self):
         cases = [
             (
-                [
-                    PoolRatioDescriptor(
-                        LayerGroupMatch(window_size_specified=True, window_size=8), 1.0
-                    )
-                ],
+                [PoolRatioDescriptor(LayerGroupMatch(window_size=8), 1.0)],
                 "matches no layer groups",
             ),
             (
-                [PoolRatioDescriptor(LayerGroupMatch(type=LayerType.ATTENTION), 1.0)],
+                [PoolRatioDescriptor(LayerGroupMatch(sink_blocks=0), 1.0)],
                 "matches 2 layer groups",
             ),
             ([PoolRatioDescriptor(LayerGroupMatch(), 1.0)], "matches 2 layer groups"),
             (
                 [
-                    PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 0.5),
-                    PoolRatioDescriptor(LayerGroupMatch(type=LayerType.ATTENTION), 0.5),
+                    PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.FULL_ATTENTION), 0.5),
+                    PoolRatioDescriptor(LayerGroupMatch(sink_blocks=0), 0.5),
                 ],
                 "matches 2 layer groups",
             ),
             (
-                [PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 0.5)] * 2,
+                [PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.FULL_ATTENTION), 0.5)] * 2,
                 "entries 0 and 1 target the same",
             ),
             (
-                [PoolRatioDescriptor(LayerGroupMatch(window_size_specified=True), 1.0)],
+                [PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.FULL_ATTENTION), 1.0)],
                 "missing layer groups",
             ),
         ]
@@ -3505,9 +3535,7 @@ class TestPoolRatioDescriptors(unittest.TestCase):
         ]
         config = replace(self.config, layers=layers)
         entries = [
-            PoolRatioDescriptor(
-                LayerGroupMatch(window_size_specified=True, window_size=128, sink_blocks=i), ratio
-            )
+            PoolRatioDescriptor(LayerGroupMatch(window_size=128, sink_blocks=i), ratio)
             for i, ratio in enumerate([0.25, 0.75])
         ]
         self.assertEqual(
@@ -3519,9 +3547,7 @@ class TestPoolRatioDescriptors(unittest.TestCase):
                 replace(
                     config,
                     initial_pool_ratio_descriptors=[
-                        PoolRatioDescriptor(
-                            LayerGroupMatch(window_size_specified=True, window_size=128), 1.0
-                        )
+                        PoolRatioDescriptor(LayerGroupMatch(window_size=128), 1.0)
                     ],
                 )
             )
@@ -3529,8 +3555,8 @@ class TestPoolRatioDescriptors(unittest.TestCase):
     def test_ssm_does_not_match_attention_properties(self):
         config = TestInitRatioConfig()._make_hybrid_config()
         entries = [
-            PoolRatioDescriptor(LayerGroupMatch(type=LayerType.SSM), 0.75),
-            PoolRatioDescriptor(LayerGroupMatch(type=LayerType.ATTENTION), 0.25),
+            PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.SSM), 0.75),
+            PoolRatioDescriptor(LayerGroupMatch(type=LayerGroupType.FULL_ATTENTION), 0.25),
         ]
         self.assertEqual(
             self.allocation(replace(config, initial_pool_ratio=[0.75, 0.25])),
@@ -3541,7 +3567,9 @@ class TestPoolRatioDescriptors(unittest.TestCase):
             config, layers=[layer for layer in config.layers if isinstance(layer, SsmLayerConfig)]
         )
         for selector in [
-            LayerGroupMatch(window_size_specified=True),
+            LayerGroupMatch(type=LayerGroupType.FULL_ATTENTION),
+            LayerGroupMatch(type=LayerGroupType.SWA),
+            LayerGroupMatch(window_size=128),
             LayerGroupMatch(sink_blocks=0),
         ]:
             with self.assertRaisesRegex(ValueError, "matches no layer groups"):
@@ -3561,13 +3589,14 @@ class TestPoolRatioDescriptors(unittest.TestCase):
 
     def test_runtime_record_validation(self):
         for kwargs in [
-            dict(window_size=128),
-            dict(window_size_specified=True, window_size=0),
-            dict(window_size_specified=True, window_size=True),
+            dict(type=LayerGroupType.FULL_ATTENTION, window_size=128),
+            dict(window_size=0),
+            dict(window_size=True),
             dict(sink_blocks="0"),
             dict(sink_blocks=-1),
-            dict(type=LayerType.SSM, window_size_specified=True),
-            dict(type="attention"),
+            dict(type=LayerGroupType.SSM, window_size=128),
+            dict(type="full_attention"),
+            dict(type="swa"),
             dict(type="ssm"),
             dict(type=0),
             dict(type=True),

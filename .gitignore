@@ -2,7 +2,11 @@ __pycache__/
 .mypy_cache/
 .vscode
 .zed
-.cursor
+.cursor/*
+!.cursor/environment.json
+!.cursor/Dockerfile
+!.cursor/cloud-agent-install.sh
+!.cursor/cloud-agent-start.sh
 *.engine
 *.engine.config
 *.cache

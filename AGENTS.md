@@ -137,6 +137,17 @@ Key files:
 2. Make changes following `CODING_GUIDELINES.md`
 3. Test locally with `pytest`
 
+## Cursor Cloud Agent
+
+Repository-managed environment: `.cursor/environment.json` (install + start scripts under `.cursor/`).
+
+- Activate the project venv: `source .venv/bin/activate` (created by install).
+- Install refreshes `git lfs`, `pip install -r requirements-dev.txt`, and `pre-commit` hooks.
+- When `nvidia-smi` works, install also runs `scripts/build_wheel.py` (editable) and `pip install -e .`. Override GPU arch with `TRTLLM_CUDA_ARCH` (e.g. `90-real`).
+- `import tensorrt_llm`, most of `pytest tests/unittest/`, and `trtllm-serve` need a built package and an NVIDIA GPU. Use a GPU-enabled machine (self-hosted Cloud Agent worker or the NGC `devel` container workflow in `docs/source/installation/build-from-source.md`) for inference and GPU tests.
+- CPU-only checks without a build: `ruff check <file>`, `pre-commit run --files <file>`.
+- Set `LLM_MODELS_ROOT` for tests that need model weights.
+
 ## Branching policy and PRs
 
 - The main repository (`upstream`) is located at https://github.com/NVIDIA/TensorRT-LLM/

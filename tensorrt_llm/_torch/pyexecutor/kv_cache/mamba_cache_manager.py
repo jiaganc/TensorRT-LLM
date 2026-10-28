@@ -3430,8 +3430,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if self.local_num_mamba_layers > 0:
             first_mamba_local_layer = self.layer_offsets[
                 self.mamba_pp_layers[0]]
-            self.ssm_layer_group_id = self.impl.get_buffer_group_id(
-                LayerId(first_mamba_local_layer), MambaRole.SSM_STATE)
+            self.ssm_layer_group_id = self.impl.get_layer_group_id(
+                LayerId(first_mamba_local_layer))
             self._ssm_page_index_scale = self.impl.get_page_index_scale(
                 LayerId(first_mamba_local_layer), MambaRole.SSM_STATE)
             num_ssm_pages = self.impl.get_page_index_upper_bound(
@@ -4033,42 +4033,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
 
-    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
-        # These kernels share one logical slot across recurrent/conv state and
-        # replay histories. Extra buffers with independent consumers may split.
-        # TODO: In a follow-up PR, pass separate recurrent-state and replay-slot
-        # indices through Mamba/KDA kernels to allow independent reuse policies.
-        coupled_roles = {
-            MambaRole.SSM_STATE, MambaRole.CONV_STATE, MambaRole.PLE_CONV_STATE,
-            MambaRole.PLE_NGRAM_CONTEXT, _KDA_REPLAY_COUNT_ROLE,
-            *(DataRole(name) for name in self._kda_replay_layout())
-        }
-        groups = set()
-        for layer in self.kv_cache_manager_py_config.layers:
-            if isinstance(layer, SsmLayerConfig):
-                groups.update(
-                    self.impl.get_buffer_group_id(layer.layer_id, buffer.role)
-                    for buffer in layer.buffers if buffer.role in coupled_roles)
-        if len(groups) > 1:
-            raise ValueError(
-                "Mamba recurrent, convolution, PLE and replay buffers require the same "
-                "reuse policy because their kernels share one state-slot index")
-        super()._prepare_page_table_tensor(index_mapper_capacity)
-
-    def _get_layer_execution_group(self, layer_id: int) -> int:
-        if self._is_local_mamba_layer(layer_id):
-            return int(
-                self.impl.get_buffer_group_id(layer_id, MambaRole.SSM_STATE))
-        return super()._get_layer_execution_group(layer_id)
-
     def _get_pool_roles(self,
                         pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
-        buffers = self.impl.buffer_grouping[pool_id]
-        if self._is_local_mamba_layer(int(buffers[0].layer_id)):
-            roles = {buffer.role for buffer in buffers}
-            role = MambaRole.SSM_STATE if MambaRole.SSM_STATE in roles else buffers[
-                0].role
-            return role, None
+        # TODO: In a follow-up PR, pass separate recurrent-state and replay-slot
+        # indices through Mamba/KDA kernels to allow independent reuse policies.
+        layer_id = int(self.impl.layer_grouping[pool_id][0])
+        if self._is_local_mamba_layer(layer_id):
+            return MambaRole.SSM_STATE, None
         return super()._get_pool_roles(pool_id)
 
     def _max_resident_sequences(self) -> int:

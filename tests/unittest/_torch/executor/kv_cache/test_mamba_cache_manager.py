@@ -5,6 +5,7 @@
 import contextlib
 import math
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -93,6 +94,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     LayerId,
+    ReusePolicy,
     SsmLayerConfig,
     _introspection,
 )
@@ -5918,3 +5920,65 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
 
     # Reset 5, 1 and 3; seeding resets 4 and 2; 0, 6 and 7 untouched.
     assert mgr.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 7, 8]
+
+
+@skip_no_cuda
+def test_v2_hybrid_initializes_split_ssm_buffers(monkeypatch):
+    original = MambaHybridCacheManagerV2._build_cache_config
+
+    def build_config(self, config):
+        config = original(self, config)
+        layers = [
+            SsmLayerConfig(
+                layer_id=layer.layer_id,
+                reuse_policy=layer.reuse_policy,
+                buffers=[
+                    *layer.buffers,
+                    BufferConfig(role="auxiliary", size=128, reuse_policy=ReusePolicy.PRIVATE),
+                ],
+            )
+            if isinstance(layer, SsmLayerConfig)
+            else layer
+            for layer in config.layers
+        ]
+        return replace(config, layers=layers)
+
+    monkeypatch.setattr(MambaHybridCacheManagerV2, "_build_cache_config", build_config)
+    manager = _build_v2_hybrid_with_mamba_layer(enable_block_reuse=True)
+    try:
+        state = manager.impl.get_buffer_group_id(0, MambaRole.SSM_STATE)
+        private = manager.impl.get_buffer_group_id(0, "auxiliary")
+        assert state != private
+        assert 0 not in manager.layer_to_pool_mapping_dict
+        assert manager.layer_to_pool_mapping_dict[1] == manager.impl.get_layer_group_id(1)
+        assert manager.ssm_layer_group_id == state
+        with pytest.raises(ValueError, match="layer groups"):
+            _ = manager.impl.layer_grouping
+        request = _make_v2_conversation_request(801, list(range(8)), "split")
+        _run_v2_hybrid_context(manager, request)
+        cache = manager.kv_cache_map[request.py_request_id]
+        assert manager.get_state_indices([request.py_request_id]) == [
+            cache.get_ssm_block_base_index(state)
+        ]
+        assert cache.get_ssm_block_base_index(private) >= 0
+        manager.suspend_request(request)
+    finally:
+        manager.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_rejects_different_policies_for_coupled_states(monkeypatch):
+    original = MambaHybridCacheManagerV2._build_cache_config
+
+    def build_config(self, config):
+        config = original(self, config)
+        for layer in config.layers:
+            if isinstance(layer, SsmLayerConfig):
+                for buffer in layer.buffers:
+                    if buffer.role == MambaRole.CONV_STATE:
+                        buffer.reuse_policy = ReusePolicy.PRIVATE
+        return config
+
+    monkeypatch.setattr(MambaHybridCacheManagerV2, "_build_cache_config", build_config)
+    with pytest.raises(ValueError, match="kernels share one state-slot index"):
+        _build_v2_hybrid_with_mamba_layer()

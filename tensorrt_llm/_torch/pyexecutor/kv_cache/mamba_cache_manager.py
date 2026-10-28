@@ -4036,6 +4036,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
         # These kernels share one logical slot across recurrent/conv state and
         # replay histories. Extra buffers with independent consumers may split.
+        # TODO: In a follow-up PR, pass separate recurrent-state and replay-slot
+        # indices through Mamba/KDA kernels to allow independent reuse policies.
         coupled_roles = {
             MambaRole.SSM_STATE, MambaRole.CONV_STATE, MambaRole.PLE_CONV_STATE,
             MambaRole.PLE_NGRAM_CONTEXT, _KDA_REPLAY_COUNT_ROLE,

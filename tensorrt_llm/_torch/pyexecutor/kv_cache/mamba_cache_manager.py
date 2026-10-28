@@ -4035,8 +4035,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _get_pool_roles(self,
                         pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
-        # TODO: In a follow-up PR, pass separate recurrent-state and replay-slot
-        # indices through Mamba/KDA kernels to allow independent reuse policies.
         layer_id = int(self.impl.layer_grouping[pool_id][0])
         if self._is_local_mamba_layer(layer_id):
             return MambaRole.SSM_STATE, None

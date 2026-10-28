@@ -5952,6 +5952,22 @@ def test_v2_hybrid_initializes_split_ssm_buffers(monkeypatch):
         assert 0 not in manager.layer_to_pool_mapping_dict
         assert manager.layer_to_pool_mapping_dict[1] == manager.impl.get_layer_group_id(1)
         assert manager.ssm_layer_group_id == state
+        from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
+        from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_to_layer_group
+        from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
+            build_kv_cache_layout_v2,
+        )
+
+        ignored = manager.get_disagg_ignored_roles()
+        monkeypatch.setattr(manager, "get_disagg_ignored_roles", lambda: ignored | {"auxiliary"})
+        page_table = build_page_table_from_manager(manager)
+        assert page_table.layer_groups[private].pool_views == []
+        assert page_table.layer_groups[private].local_layers == []
+        assert get_layer_to_layer_group(page_table, CacheKind.STATE) == {0: state}
+        layout = build_kv_cache_layout_v2(manager)
+        assert len(layout.groups) == len(manager.impl.buffer_grouping)
+        with pytest.raises(ValueError, match="spans several groups"):
+            layout.group_of_layer(0)
         with pytest.raises(ValueError, match="layer groups"):
             _ = manager.impl.layer_grouping
         request = _make_v2_conversation_request(801, list(range(8)), "split")

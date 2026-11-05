@@ -31,6 +31,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
     get_layer_to_layer_group,
     get_pool_view_global_layer_ids,
+    is_standalone_draft_group,
 )
 
 # Type alias for (lg_idx, pool_idx) pair
@@ -179,7 +180,12 @@ class PeerRegistrar:
             self_page_table,
             peer_ri.page_table,
         )
-        AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
+        AttentionPolicy.validate_peer_compatible(
+            self_page_table,
+            peer_ri.page_table,
+            self._ri.attention.tokens_per_block if self._ri.attention is not None else None,
+            peer_ri.attention.tokens_per_block if peer_ri.attention is not None else None,
+        )
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -423,8 +429,13 @@ class PeerRegistrar:
                 peer_overlap_positions[0] if peer_overlap_positions else 0
             )
 
+        mapper_peer_ri = peer_ri
+        if is_standalone_draft_group(self_lg):
+            # A standalone draft group maps heads on its own rank grid.
+            policy = AttentionPolicy(AttentionPolicy.draft_group_rank_info(self._ri, self_lg))
+            mapper_peer_ri = AttentionPolicy.draft_group_rank_info(peer_ri, peer_lg)
         mapper = policy.build_mapper(
-            peer_ri=peer_ri,
+            peer_ri=mapper_peer_ri,
             mapper_kind=self_pv.mapper_kind,
             self_layer_offsets=self_layer_offsets,
             peer_layer_offsets=peer_layer_offsets,
@@ -587,10 +598,35 @@ class PeerRegistrar:
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
         pool_view = layer_group.pool_views[pool_idx]
+        if is_standalone_draft_group(layer_group):
+            return self._should_send_draft_pool(peer_rank_info, layer_group_id, pool_idx)
         # Delegate to the policy's should_send. None means fan-in election.
         policy = self._get_policy(layer_group.kind)
         result = policy.should_send(peer_overlap, peer_rank_info, mapper_kind=pool_view.mapper_kind)
         return self._owns_tp_fan_in(peer_rank_info) if result is None else result
+
+    def _should_send_draft_pool(
+        self, peer_rank_info: RankInfo, layer_group_id: int, pool_idx: int
+    ) -> bool:
+        """Ownership of one standalone draft view on the drafter's own rank grid.
+
+        Draft KV is laid out over the flattened TP x CP grid (``cp_as_tp``), so
+        the target's helix overlap does not decide the pairing: a sender
+        writes only to receivers whose grid shard covers its own, and among
+        head replicas one sender per receiver is elected.
+        """
+        peer_lg_id, _ = self.get_pool_mapping(peer_rank_info)[(layer_group_id, pool_idx)]
+        layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
+        peer_lg = peer_rank_info.page_table.layer_groups[peer_lg_id]
+        local = AttentionPolicy.draft_group_rank_info(self._ri, layer_group)
+        peer = AttentionPolicy.draft_group_rank_info(peer_rank_info, peer_lg)
+        if local.tp_size <= peer.tp_size:
+            if peer.tp_rank // (peer.tp_size // local.tp_size) != local.tp_rank:
+                return False
+        elif local.tp_rank // (local.tp_size // peer.tp_size) != peer.tp_rank:
+            return False
+        duplicate, _ = AttentionPolicy(local).duplicate_head_factors(peer)
+        return duplicate <= 1 or peer.dp_rank % duplicate == local.tp_rank % duplicate
 
     def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
         # to ensure the transfer aux is not duplicated

@@ -89,7 +89,10 @@ from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_unique_pool_memory_descs,
+    is_standalone_draft_group,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import CUASSERT, nvtx_range
@@ -115,6 +118,58 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 
+class _AgentOperationGate:
+    """Reader/writer gate between NIXL transfers and remote-metadata loads.
+
+    A remote-metadata load (``load_remote_agent``) holds NIXL's metadata lock
+    while UCX creates endpoints, which can take seconds. Releasing a transfer
+    request (the ``TransferStatus`` destructor) needs that lock and runs with
+    the GIL held, so a release that overlaps a load freezes every Python
+    thread of the process. Transfers enter as readers for the full
+    submit + wait + release interval; a load enters as the single writer once
+    no transfer is active, and waits here with the GIL released.
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._active_transfers = 0
+        self._metadata_active = False
+        self._metadata_waiters = 0
+
+    @contextmanager
+    def transfer(self):
+        with self._condition:
+            # A waiting metadata load goes first so a continuous transfer
+            # stream cannot starve first-use peer registration.
+            while self._metadata_active or self._metadata_waiters > 0:
+                self._condition.wait()
+            self._active_transfers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active_transfers -= 1
+                if self._active_transfers == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def metadata(self):
+        with self._condition:
+            self._metadata_waiters += 1
+            try:
+                while self._metadata_active or self._active_transfers > 0:
+                    self._condition.wait()
+                self._metadata_active = True
+            finally:
+                self._metadata_waiters -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._metadata_active = False
+                self._condition.notify_all()
+
+
 @dataclass
 class RecvReqInfo:
     sender_req_id: int
@@ -130,6 +185,10 @@ class RecvReqInfo:
     aux_slot: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
+    # Set by a context-first receiver, which sends REQUEST_DATA only to the
+    # context ranks that hold the request's KV cache; see
+    # Sender.sweep_stale_req_infos.
+    context_first: bool = False
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -145,6 +204,7 @@ class RecvReqInfo:
                 "aux_slot": self.aux_slot,
                 "slice_id": self.slice_id,
                 "bounce_dst_base": self.bounce_dst_base,
+                "context_first": self.context_first,
             }
         )
 
@@ -577,6 +637,7 @@ class Sender(SenderBase):
         # Guards concurrent add() from the listener thread.
         self._loaded_remote_agents: set[str] = set()
         self._loaded_remote_agents_lock = threading.Lock()
+        self._agent_operation_gate = _AgentOperationGate()
         self._ownership_poisoned: Optional[Exception] = None
         self._ownership_poison_lock = (
             threading.Lock() if retirement_watchdog is None else retirement_watchdog.lock
@@ -640,9 +701,16 @@ class Sender(SenderBase):
     def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
 
-        Called opportunistically from the listener thread when a new REQUEST_DATA
-        arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
-        entries that are never consumed; this sweep prevents unbounded growth.
+        Called from the executor thread while it checks context transfer status.
+        With gen-first ADP broadcast, non-assigned DP ranks accumulate entries
+        that are never consumed; this sweep prevents unbounded growth.
+
+        A context-first receiver sends REQUEST_DATA only to the ranks that hold
+        its request's KV cache, after the context phase produced it. When no
+        TxSession has claimed such an entry within the TTL, none ever will (the
+        session already ended, or the receiver names a request this rank never
+        had), so the receiver is told that the transfer failed instead of
+        waiting for data that will not arrive.
         """
         now = time.monotonic()
         with self._peer_requests_lock:
@@ -653,12 +721,26 @@ class Sender(SenderBase):
             ]
         if not stale_rids:
             return
+        orphaned_infos: list[RecvReqInfo] = []
         for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
                 if rid not in self._sessions and rid in self._peer_requests:
-                    self._peer_requests.pop(rid, None)
+                    req_info_map = self._peer_requests.pop(rid, None)
                     self._peer_requests_timestamps.pop(rid, None)
+                    if req_info_map:
+                        orphaned_infos.extend(
+                            info for info in req_info_map.values() if info.context_first
+                        )
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
+        for info in orphaned_infos:
+            logger.warning(
+                f"KV transfer request rid={info.unique_rid} from receiver "
+                f"{info.instance_name} rank {info.instance_rank} has no TxSession on this "
+                f"rank after {self._STALE_REQ_INFO_TTL_S:.0f}s; failing it"
+            )
+            # The listener's DEALER sockets are not thread-safe, so the result goes
+            # through the worker queue that serves this (request, peer) pair.
+            self._send_failed_result_to_receiver(info, defer_to_worker=True)
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
@@ -783,9 +865,17 @@ class Sender(SenderBase):
         request: TransferRequest,
     ) -> tuple[bool, Optional[str]]:
         if not self._enforce_physical_ownership:
-            status = self._agent.submit_transfer_requests(request)
-            completed = status.wait()
-            detail = None if completed else getattr(status, "last_status_str", lambda: None)()
+            with self._agent_operation_gate.transfer():
+                status = self._agent.submit_transfer_requests(request)
+                try:
+                    completed = status.wait()
+                    detail = (
+                        None if completed else getattr(status, "last_status_str", lambda: None)()
+                    )
+                finally:
+                    # The status destructor releases the NIXL request; it must
+                    # run inside the gate, before a metadata load can start.
+                    del status
             return completed, detail
         with self._ownership_poison_lock:
             if self._ownership_poisoned is not None:
@@ -1395,7 +1485,17 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
+                if is_standalone_draft_group(lg_info):
+                    # Standalone draft KV on the flattened TP x CP grid: a
+                    # receiver keeps every draft_shards-th global page of its
+                    # head, starting at its grid rank. Draft shards of 1 keep
+                    # every page, also under helix.
+                    peer_lg_info = peer_ri.page_table.layer_groups[peer_lg]
+                    draft_shards = int(getattr(peer_lg_info, "cp_as_tp_shards", 1))
+                    if draft_shards > 1:
+                        _, flat_rank = AttentionPolicy.draft_rank_grid(peer_ri)
+                        src_block_ids = src_block_ids[flat_rank % draft_shards :: draft_shards]
+                elif peer_ri.cp_size > 1 and self_ri.cp_size == 1:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix), so its
                     # table is the strided subset of ours; block reuse is
@@ -1593,17 +1693,26 @@ class Sender(SenderBase):
         ri: RankInfo = RankInfo.from_bytes(message[1])
         agent_name = ri.instance_name + str(ri.instance_rank)
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
-        # NIXL serializes descriptor load against submit internally. This lock
-        # only closes the local load-vs-shutdown window; active transfers do
-        # not need to drain before a new peer is registered.
+        # The lock closes the local load-vs-shutdown window. Without physical
+        # ownership the gate drains active transfers first (see
+        # _AgentOperationGate): NIXL also serializes the load against
+        # requests, but a request released while the load runs would block
+        # with the GIL held. Physical-ownership transfers keep their status in
+        # the task and never enter the gate, so the load does not wait there.
         with self._loaded_remote_agents_lock:
             if self._shutdown_requested:
                 return
             self._registrar.register(ri.instance_name, ri.instance_rank, ri)
-            self._agent.load_remote_agent(
-                agent_name,
-                ri.transfer_engine_info,
+            metadata_gate = (
+                nullcontext()
+                if self._enforce_physical_ownership
+                else self._agent_operation_gate.metadata()
             )
+            with metadata_gate:
+                self._agent.load_remote_agent(
+                    agent_name,
+                    ri.transfer_engine_info,
+                )
             self._loaded_remote_agents.add(agent_name)
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
@@ -1707,6 +1816,10 @@ class Sender(SenderBase):
                 else:
                     self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
+                    if session.aux_task is not None and session.carries_draft_history:
+                        # Context-first draft-history transfers create the aux
+                        # task at send time, possibly before this peer asked.
+                        tasks.append(session.aux_task)
                     terminal = session.has_failed()
                     include_aux = terminal and bool(
                         session._claim_unsubmitted_aux_failures_locked((info,))
@@ -1968,7 +2081,11 @@ class TxSession(TxSessionBase):
         self._timeout_s = timeout_s
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        # A unified standalone draft cache sends its history through the aux
+        # buffer under every schedule style.
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or (
+            _carries_draft_history(aux_buffer)
+        )
         self._enforce_physical_ownership = getattr(sender, "_enforce_physical_ownership", False)
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
@@ -2029,6 +2146,11 @@ class TxSession(TxSessionBase):
         if params.ctx_request_id is not None:
             return params.ctx_request_id
         return self.request_id
+
+    @property
+    def carries_draft_history(self) -> bool:
+        """Whether the aux transfer carries a unified standalone drafter's history."""
+        return _carries_draft_history(self._aux_buffer)
 
     @property
     def status(self) -> SessionStatus:
@@ -2754,6 +2876,10 @@ class Receiver(ReceiverBase):
             dst_start_token=None,
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
+            context_first=(
+                task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST
+                and task._params.ctx_dp_rank is not None
+            ),
         )
 
     @staticmethod
@@ -2785,6 +2911,22 @@ class Receiver(ReceiverBase):
         # a masked PP stage may advertise no replicated view even though another
         # stage owns one that is visible in the receiver's page table.
         if len(overlap.ranks) > 1:
+            draft_groups = [
+                layer_group
+                for layer_group in getattr(peer_ri.page_table, "layer_groups", ())
+                if is_standalone_draft_group(layer_group)
+            ]
+            if draft_groups:
+                draft_tp, _ = AttentionPolicy.draft_rank_grid(peer_ri)
+                for layer_group in draft_groups:
+                    if (
+                        layer_group.total_kv_head_num is None
+                        or layer_group.kv_head_num_per_rank * draft_tp
+                        > layer_group.total_kv_head_num
+                    ):
+                        # Standalone draft head replicas elect fewer writers
+                        # than the target's heads, so payload shares differ.
+                        return False
             for page_table in (peer_ri.page_table, receiver_page_table):
                 if page_table is None:
                     continue
@@ -3198,7 +3340,9 @@ class RxSession(RxSessionBase):
     ):
         super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or (
+            _carries_draft_history(aux_buffer)
+        )
         self._enforce_physical_ownership = getattr(receiver, "_enforce_physical_ownership", False)
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
@@ -3775,6 +3919,8 @@ class RxSession(RxSessionBase):
         """Read token data from the aux buffer slot into the given request."""
         assert self._aux_buffer is not None, "No aux_buffer set for this session"
         assert self.aux_slot is not None, "No aux_slot set for this session"
+        if _carries_draft_history(self._aux_buffer):
+            self.unpack_draft_history(request)
         first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens) = (
             self._aux_buffer.get_slot_data(self.aux_slot)
         )
@@ -3789,6 +3935,14 @@ class RxSession(RxSessionBase):
                     "cached_tokens": cached_tokens,
                 },
             }
+
+    def unpack_draft_history(self, request: LlmRequest) -> None:
+        """Read standalone draft history without changing context-first token fields."""
+        if self._aux_buffer is None or self.aux_slot is None:
+            raise ValueError("Standalone draft transfer requires an auxiliary buffer slot")
+        request.py_draft_transfer_history = self._aux_buffer.get_slot_draft_history(  # type: ignore[attr-defined]
+            self.aux_slot
+        )
 
     def is_completed(self) -> bool:
         """Non-blocking check: has the transfer completed successfully?
@@ -4099,10 +4253,20 @@ def _create_nixl_agent(
     )
 
 
+def _carries_draft_history(aux_buffer: Optional[AuxBuffer]) -> bool:
+    """Whether an aux buffer transfers a unified standalone drafter's history."""
+    return aux_buffer is not None and getattr(aux_buffer, "has_draft_history", False) is True
+
+
 def _make_aux_buffer(
     kvm: KVCacheManagerV2, max_slots: int, max_draft_len: Optional[int] = None
 ) -> Optional[AuxBuffer]:
+    # Only a manager that owns unified standalone draft layers transfers their
+    # history; every other manager keeps the four-buffer aux layout.
+    draft_history = getattr(kvm, "has_standalone_draft_cache", False) is True
     if max_slots <= 0:
+        if draft_history:
+            raise ValueError("Standalone draft transfer requires auxiliary buffer slots")
         return None
     if max_draft_len is None:
         max_draft_len = max(0, int(getattr(kvm, "max_draft_len", 0)))
@@ -4111,6 +4275,7 @@ def _make_aux_buffer(
         beam_width=max(1, int(getattr(kvm, "max_beam_width", 1))),
         max_draft_len=max_draft_len,
         device="cpu",
+        draft_history=draft_history,
     )
 
 

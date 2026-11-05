@@ -55,6 +55,7 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.join(current_dir, ".."))
 
 from ..blackwell.dense_blockscaled_gemm_persistent import Sm100BlockScaledPersistentDenseGemmKernel
+from .fp8_output_epilogue import epilogue_tma_store_fp8
 
 """
 This example provides an implementation of the SM107 batched dense blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
@@ -197,10 +198,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         raster_order: Literal["m", "n"] = "m",
         scheduler_type: Type = None,
         split_k: int = 1,
+        epi_tile_n: Union[int, None] = None,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
 
         self.mma_inst_shape = mma_inst_shape
+        # None: the default epilogue subtile from compute_epilogue_tile_shape. Otherwise the
+        # epilogue subtile N (it must divide the CTA tile N); with a K-short mainloop, wider
+        # subtiles cut the per-tile TMEM-load / SMEM-store / TMA-store iterations.
+        self.epi_tile_n_override = epi_tile_n
         self.mma_tiler = mma_tiler
         self.use_2cta_instrs = mma_inst_shape[0] == 256
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -569,6 +575,17 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.c_layout,
             self.c_dtype,
         )
+        if self.epi_tile_n_override is not None:
+            cta_tile_n = self.cta_tile_shape_mnk[1]
+            if self.cta_tile_shape_mnk[0] < 128 or cta_tile_n % self.epi_tile_n_override != 0:
+                raise ValueError(
+                    f"Epilogue subtile N={self.epi_tile_n_override} needs a CTA tile with M >= 128 "
+                    f"and N divisible by it, got {self.cta_tile_shape_mnk[:2]}."
+                )
+            self.epi_tile = (
+                cute.make_layout(cute.size(self.epi_tile[0])),
+                cute.make_layout(self.epi_tile_n_override),
+            )
         self.epi_tile_n = cute.size(self.epi_tile[1])
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
@@ -859,6 +876,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         self.b_dtype: Type[cutlass.Numeric] = b_ptr.value_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa_ptr.value_type
         self.c_dtype: Type[cutlass.Numeric] = c_ptr.value_type
+        if cutlass.const_expr(self.c_dtype == cutlass.Float8E4M3FN):
+            assert self.sf_dtype == cutlass.Float8E8M0FNU
+            assert self.a_dtype == cutlass.Float8E4M3FN
+            assert self.b_dtype == cutlass.Float8E4M3FN
+            assert self.split_k == 1
 
         m, n, k, l = problem_mnkl
         self.a_major_mode, self.b_major_mode, self.c_layout = layouts
@@ -1200,7 +1222,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
         """
-        alpha_value = alpha[0].to(self.c_dtype)
+        # FP8 output scales and rounds through BF16 (fp8_output_epilogue).
+        alpha_dtype = self.c_dtype
+        if cutlass.const_expr(self.c_dtype == cutlass.Float8E4M3FN):
+            alpha_dtype = cutlass.BFloat16
+        alpha_value = alpha[0].to(alpha_dtype)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1942,7 +1968,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     work_tile = tile_sched.get_current_work()
                 epi_tiles_executed += 1
 
-                acc_consumer_state = utils.gemm.sm100.epilogue_tma_store(
+                epilogue_store = utils.gemm.sm100.epilogue_tma_store
+                if cutlass.const_expr(self.c_dtype == cutlass.Float8E4M3FN):
+                    epilogue_store = epilogue_tma_store_fp8
+                acc_consumer_state = epilogue_store(
                     self,
                     tidx,
                     warp_idx,
@@ -2114,13 +2143,20 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 f"Please refer to the supported combinations in the function documentation."
             )
 
-        # Check valid c_dtype
+        # Check valid c_dtype. FP8 output (E4M3, BF16-rounded) is MXFP8 only.
         if c_dtype not in {
             cutlass.Float32,
             cutlass.Float16,
             cutlass.BFloat16,
+            cutlass.Float8E4M3FN,
         }:
             raise testing.CantImplementError(f"Unsupported output data type: {c_dtype}")
+        if c_dtype == cutlass.Float8E4M3FN and not (
+            a_dtype == cutlass.Float8E4M3FN
+            and b_dtype == cutlass.Float8E4M3FN
+            and sf_dtype == cutlass.Float8E8M0FNU
+        ):
+            raise testing.CantImplementError("FP8 output needs MXFP8 E4M3 operands")
 
     @staticmethod
     def is_valid_layouts(
@@ -2374,6 +2410,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             )
             if split_k < 1:
                 raise testing.CantImplementError(f"split_k must be >= 1, got {split_k}")
+            if split_k > 1 and c_dtype == cutlass.Float8E4M3FN:
+                raise testing.CantImplementError("split_k > 1 reduces in C; FP8 output cannot")
             if split_k > 1:
                 num_k_tiles = k // mma_tiler[2]
                 if l != 1 or k % mma_tiler[2] != 0 or num_k_tiles % split_k != 0:

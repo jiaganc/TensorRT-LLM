@@ -46,10 +46,11 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager,
                            should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
-from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler,
-                    is_disagg_enabled, is_mla, validate_feature_combination)
-from .config_utils import (is_hybrid_linear, is_minimax_m3,
+from ._util import (KIMI_K3_TORCH_MEM_SAFETY_MARGIN, KvCacheCreator,
+                    _adjust_torch_mem_fraction, create_py_executor_instance,
+                    instantiate_sampler, is_disagg_enabled, is_mla,
+                    validate_feature_combination)
+from .config_utils import (is_hybrid_linear, is_kimi_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -72,6 +73,22 @@ _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 FP4_MLA_TOKENS_PER_BLOCK = 128
+# NVFP4 quantizes the MLA latent in 16-token tiles; only the final chunk of a
+# prompt may end inside one (its tail lives in the BF16 HP ring).
+FP4_MLA_QUANTIZATION_TILE_SIZE = 16
+
+
+def _validate_fp4_mla_chunk_size(*, uses_fp4_mla: bool,
+                                 enable_chunked_prefill: bool,
+                                 max_num_tokens: int) -> None:
+    """Require tile-aligned non-final chunks for dense FP4 MLA cache writes."""
+    if (uses_fp4_mla and enable_chunked_prefill
+            and max_num_tokens % FP4_MLA_QUANTIZATION_TILE_SIZE != 0):
+        raise ValueError(
+            "Dense NVFP4 MLA chunked prefill requires max_num_tokens to be "
+            f"a multiple of {FP4_MLA_QUANTIZATION_TILE_SIZE}, got "
+            f"{max_num_tokens}. Only the final chunk may contain a partial "
+            "FP4 quantization tile backed by the HP pool.")
 
 
 class _ExecutorMemoryMonitor:
@@ -854,19 +871,14 @@ def _create_py_executor(
 
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = model_engine.max_num_seq_slots
+    uses_fp4_mla = uses_fp4_mla_attention(model_engine.model.model_config)
     if is_mla(config):
-        if uses_fp4_mla_attention(model_engine.model.model_config):
+        if uses_fp4_mla:
             tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
             kv_cache_config.tokens_per_block = tokens_per_block
             logger.info(
                 f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
             )
-            if kv_cache_config.enable_block_reuse:
-                logger.warning(
-                    "FP4 MLA cached-context attention is not supported yet; "
-                    "disabling KV cache block reuse.")
-                kv_cache_config.enable_block_reuse = False
-                model_engine.attn_runtime_features.cache_reuse = False
         elif model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
             # Propagate the override back to kv_cache_config so any consumer
@@ -901,10 +913,10 @@ def _create_py_executor(
         if kv_cache_config.enable_block_reuse and not (
                 kv_cache_quant_algo is None or kv_cache_quant_algo
                 == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8
-                or nvfp4_sparse_cache_reuse):
+                or nvfp4_sparse_cache_reuse or uses_fp4_mla):
             logger.warning(
                 f"KV cache reuse for MLA can only be enabled without KV cache quantization, with FP8 quantization, "
-                f"or with NVFP4 quantization on the DSA or DeepSeek-V4 sparse paths, "
+                f"or with NVFP4 quantization on the dense FP4 MLA, DSA, or DeepSeek-V4 sparse paths, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
@@ -916,6 +928,20 @@ def _create_py_executor(
                            f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
+        if (uses_fp4_mla and kv_cache_config.enable_block_reuse
+                and not enable_chunked_context):
+            # Only the chunked-prefill path gathers a reused prefix from FP4
+            # storage; the cached-KV C++ ops cannot read it.
+            logger.warning(
+                "FP4 MLA reads a reused KV prefix only through chunked "
+                "prefill; disabling KV cache block reuse because "
+                "enable_chunked_prefill is False.")
+            kv_cache_config.enable_block_reuse = False
+            model_engine.attn_runtime_features.cache_reuse = False
+
+    _validate_fp4_mla_chunk_size(uses_fp4_mla=uses_fp4_mla,
+                                 enable_chunked_prefill=enable_chunked_context,
+                                 max_num_tokens=max_num_tokens)
 
     if (kv_cache_config.enable_block_reuse
             and model_engine.model.model_config.is_encoder_decoder
@@ -1318,7 +1344,11 @@ def _create_py_executor(
                 max_num_sequences=max_num_seq_slots,
             )
 
-    _adjust_torch_mem_fraction()
+    if is_kimi_linear(model_engine.model.model_config.pretrained_config):
+        _adjust_torch_mem_fraction(
+            safety_margin=KIMI_K3_TORCH_MEM_SAFETY_MARGIN)
+    else:
+        _adjust_torch_mem_fraction()
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")

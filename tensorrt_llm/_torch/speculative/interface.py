@@ -32,11 +32,14 @@ from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..pyexecutor.input_commit import active_input_commit
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+    from ..pyexecutor.kv_cache.standalone_draft_cache import DraftHistoryUpdate
     from ..pyexecutor.llm_request import LlmRequest
+    from ..pyexecutor.resource_manager import ResourceManager
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -880,7 +883,13 @@ class SpecMetadata:
                                        dtype=torch.int64,
                                        device='cuda')
 
+        # Set by the decoder runner for a batched input commit (input_commit.py).
+        input_commit = active_input_commit()
+
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
+            if input_commit is not None:
+                input_commit.stage(dst[:len(values)], values)
+                return
             dst[:len(values)].copy_(torch.tensor(values,
                                                  dtype=torch.int64,
                                                  pin_memory=prefer_pinned()),
@@ -1417,18 +1426,26 @@ class SpecMetadata:
 
         self._populate_request_rng_state(requests, per_request_normalized)
 
+        # Set by the decoder runner for a batched input commit (input_commit.py).
+        input_commit = active_input_commit()
+
+        def _upload(dst: torch.Tensor, values: list,
+                    dtype: torch.dtype) -> None:
+            if input_commit is not None:
+                input_commit.stage(dst[:len(values)], values)
+                return
+            dst[:len(values)].copy_(torch.tensor(values,
+                                                 dtype=dtype,
+                                                 pin_memory=prefer_pinned()),
+                                    non_blocking=True)
+
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
         # draft-sampler time to scatter draft probs by slot. The penalties need the
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling
                 or self.enable_penalty) and self.batch_slot_ids is not None:
-            self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
-                torch.tensor(per_request_slot_ids,
-                             dtype=torch.long,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            _upload(self.batch_slot_ids, per_request_slot_ids, torch.long)
 
         # Penalties are independent of the greedy/advanced split -- they rewrite the
         # logits before sampling, so an all-greedy batch is penalized too (its argmax
@@ -1466,30 +1483,12 @@ class SpecMetadata:
                 if fill_min_p:
                     request_min_ps.append(mp_val)
 
-            self.request_temperatures[:len(request_temperatures)].copy_(
-                torch.tensor(request_temperatures,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True)
-            self.request_top_ks[:len(request_top_ks)].copy_(
-                torch.tensor(request_top_ks,
-                             dtype=torch.int32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
-            self.request_top_ps[:len(request_top_ps)].copy_(
-                torch.tensor(request_top_ps,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            _upload(self.request_temperatures, request_temperatures,
+                    torch.float32)
+            _upload(self.request_top_ks, request_top_ks, torch.int32)
+            _upload(self.request_top_ps, request_top_ps, torch.float32)
             if fill_min_p:
-                self.request_min_ps[:len(request_min_ps)].copy_(
-                    torch.tensor(request_min_ps,
-                                 dtype=torch.float32,
-                                 pin_memory=prefer_pinned()),
-                    non_blocking=True,
-                )
+                _upload(self.request_min_ps, request_min_ps, torch.float32)
 
             # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
             # encounter boolean-tensor indexing (dynamic size) or .item()
@@ -1513,19 +1512,11 @@ class SpecMetadata:
                 if fill_min_p:
                     min_ps.extend(mp_val for _ in range(num_tokens))
 
-            self.temperatures[:len(temperatures)].copy_(torch.tensor(
-                temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                        non_blocking=True)
-            self.top_ks[:len(top_ks)].copy_(torch.tensor(
-                top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
-            self.top_ps[:len(top_ps)].copy_(torch.tensor(
-                top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
+            _upload(self.temperatures, temperatures, torch.float32)
+            _upload(self.top_ks, top_ks, torch.int32)
+            _upload(self.top_ps, top_ps, torch.float32)
             if fill_min_p:
-                self.min_ps[:len(min_ps)].copy_(torch.tensor(
-                    min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                non_blocking=True)
+                _upload(self.min_ps, min_ps, torch.float32)
 
     def _sampling_params_buffers_need_update(
         self, per_request_normalized: list[tuple[float, int, float, float, int]]
@@ -1678,6 +1669,30 @@ class SpecWorkerBase(nn.Module, ABC):
             handler.commit_speculative_states(num_accepted_tokens,
                                               state_indices, num_contexts)
 
+    def prepare_managed_draft_cache(
+        self,
+        draft_model: Optional[nn.Module],
+        spec_metadata: "SpecMetadata",
+        attn_metadata: AttentionMetadata,
+        resource_manager: "ResourceManager",
+    ) -> None:
+        """Stage draft context the KV cache manager owns before a forward.
+
+        Called after the inputs are prepared and before eager execution,
+        CUDA graph capture or replay. A worker whose drafter keeps its context
+        KV in the target manager's draft layers restores the requests' draft
+        history and block tables here; the default does nothing.
+        """
+
+    def snapshot_managed_draft_history(self) -> Optional["DraftHistoryUpdate"]:
+        """Read back this forward's draft history for publication.
+
+        Called after every non-warmup forward. The executor publishes the
+        returned update once the iteration's sampling has completed; the
+        default has none.
+        """
+        return None
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if "forward" in cls.__dict__:
@@ -1712,6 +1727,13 @@ class SpecWorkerBase(nn.Module, ABC):
     @abstractmethod
     def _forward_impl(self, *args, **kwargs):
         """Worker-specific forward logic, called by SpecWorkerBase.forward."""
+
+    def target_head_rows(self, hidden_states: torch.Tensor, attn_metadata,
+                         spec_metadata) -> torch.Tensor:
+        """The rows of the target's final ``hidden_states`` that the target
+        head reads (``spec_metadata.gather_ids``), handed to
+        ``target_logits``."""
+        return hidden_states[spec_metadata.gather_ids]
 
     def target_logits(self, hidden_states: torch.Tensor, lm_head,
                       logits_processor, attn_metadata, spec_metadata,

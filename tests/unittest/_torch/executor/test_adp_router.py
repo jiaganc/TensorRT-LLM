@@ -1634,6 +1634,22 @@ class TestConversationAwareADPRouter:
         self._route(router, self._states(2), [child_turn2])
         assert child_turn2.request.py_uncached_prefill_tokens == 500
 
+    def test_uncached_prefill_estimate_does_not_depend_on_the_rank(self):
+        """A turn that overflows off its full home rank is estimated like a turn
+        at home, and the next turn back home is measured against it."""
+        router = self._router(tp_size=2)
+        router.set_publish_uncached_estimate(True)
+        opener = _make_conv_request_item(0, "A", num_tokens=5000)
+        home = self._route(router, self._states(2), [opener])[0]
+        full = [0, 0]
+        full[home] = 4
+        overflow = _make_conv_request_item(1, "A", num_tokens=5300)
+        assert self._route(router, self._states(2, full), [overflow], cap=4)[1] != home
+        assert overflow.request.py_uncached_prefill_tokens == 300
+        back = _make_conv_request_item(2, "A", num_tokens=5600)
+        assert self._route(router, self._states(2), [back])[2] == home
+        assert back.request.py_uncached_prefill_tokens == 300
+
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)
         items = [_make_conv_request_item(i, None) for i in range(8)]

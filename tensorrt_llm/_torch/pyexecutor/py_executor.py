@@ -125,12 +125,15 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
+from .scheduler.adp_kv_balance import select_kv_balanced_requests
 from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
-                                   count_retiring_requests)
+                                   _num_input_tokens, count_retiring_requests)
 from .scheduler.gen_admission_queue import (GenAdmissionConfig,
                                             GenAdmissionWaitingQueue)
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
+from .ull_shell import (ExecutorThreadPin, apply_gil_switch_interval,
+                        report_default_on_switches)
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -430,6 +433,23 @@ def _request_flag(request, name: str) -> bool:
     if callable(value):
         value = value()
     return bool(value)
+
+
+def _is_single_rank_context_only_attention_dp(dist, kv_cache_manager) -> bool:
+    """Whether an attention-DP group is one rank alone, on a context-only cache.
+
+    With one TP x CP rank, ``PyExecutor._can_queue`` votes over that rank's own
+    batch, so an empty batch vetoes no peer and a padding dummy only adds a
+    forward. Limited to the context-only KDA / FP4 MLA caches of disaggregated
+    context workers (e.g. the tp1 attention-DP context servers of a Kimi K3
+    deployment), where that forward is a full prefill of a one-token context
+    dummy.
+    """
+    if not (getattr(kv_cache_manager, "kda_context_only", False) is True
+            or getattr(kv_cache_manager, "fp4_mla_context_only_cache",
+                       False) is True):
+        return False
+    return dist.tp_size <= 1 and dist.cp_size <= 1
 
 
 class PyExecutor:
@@ -815,6 +835,15 @@ class PyExecutor:
         self._last_remote_tail_phase = RemoteTailPhase.DECODE
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        # KV-length-balanced admission for attention-DP generation workers
+        # (scheduler/adp_kv_balance.py). Opt-in; set only on GEN workers.
+        self._adp_kv_balance = (self.enable_attention_dp and os.environ.get(
+            "TRTLLM_ADP_KV_BALANCE", "0") == "1")
+        self._adp_kv_balance_window = int(
+            os.environ.get("TRTLLM_ADP_KV_BALANCE_WINDOW", "32"))
+        self._adp_kv_balance_max_wait_iters = int(
+            os.environ.get("TRTLLM_ADP_KV_BALANCE_MAX_WAIT_ITERS", "64"))
+        self._adp_kv_balance_wait_rounds: Dict[int, int] = {}
         # Buffer for responses staged by rank-divergent paths (disagg transfer
         # completion, ADP error handling). With ADP, _enqueue_responses does a
         # tp_gather collective; the owning DP rank has a response but the other
@@ -5651,6 +5680,11 @@ class PyExecutor:
             self.control_action_done.wait()
         self.control_action_done.clear()
         self._active_control_id = None
+        dwdp_manager = getattr(self, "dwdp_manager", None)
+        if dwdp_manager is not None:
+            # The action may have changed the expert weights that DWDP
+            # prefetched ahead of the next forward pass.
+            dwdp_manager.invalidate_prefetch()
         logger.debug("[control_action] control request finished")
 
     def _sync_and_process_resource_governor_queue(self):
@@ -6175,9 +6209,15 @@ class PyExecutor:
             iter_stats = None
             previous_tensors_device = None
             can_forward = not self.is_benchmark_disagg
+            # TRTLLM_K3_ULL_PIN_EXECUTOR / TRTLLM_K3_ULL_GIL_SWITCH_US (ull_shell.py).
+            executor_pin = ExecutorThreadPin.create()
+            apply_gil_switch_interval()
+            report_default_on_switches()
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                if executor_pin is not None:
+                    executor_pin.maybe_refresh(self.iter_counter)
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -7090,6 +7130,33 @@ class PyExecutor:
             return new_requests
         return self._apply_mm_encoder_admission(waiting_queue, new_requests)
 
+    def _pop_kv_balanced_from_waiting_queue(
+        self, waiting_queue: WaitingQueue, total_num_active_requests: int,
+        all_rank_states: List[RankState]
+    ) -> Optional[Tuple[List[RequestQueueItem], Dict[int,
+                                                      List[RequestQueueItem]]]]:
+        """KV-balanced variant of ``_pop_from_waiting_queue`` (see adp_kv_balance).
+
+        Returns None to fall back to FIFO admission (benchmark fill phase,
+        warmup, or a non-plain request at the head of the queue).
+        """
+        if self.is_warmup or (self.is_benchmark_disagg
+                              and self._benchmark_fill_phase_active):
+            return None
+        max_new_requests = (self._get_request_admission_capacity() -
+                            total_num_active_requests)
+        ordered = sorted(all_rank_states, key=lambda state: state.rank)
+        return select_kv_balanced_requests(
+            waiting_queue,
+            rank_tokens=[state.num_active_tokens for state in ordered],
+            rank_num_requests=[state.num_active_requests for state in ordered],
+            max_num_active_requests=self.max_num_active_requests,
+            max_new=max_new_requests,
+            window=self._adp_kv_balance_window,
+            max_wait_iters=self._adp_kv_balance_max_wait_iters,
+            wait_rounds=self._adp_kv_balance_wait_rounds,
+            num_tokens_fn=lambda item: _num_input_tokens(item.request))
+
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
             self, waiting_queue: WaitingQueue,
@@ -7193,9 +7260,23 @@ class PyExecutor:
         self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
 
         # 3. Pop requests from waiting queue
-        new_requests = self._pop_from_waiting_queue(
-            waiting_queue, total_num_active_requests,
-            all_ranks_num_active_requests)
+        kv_balanced_assignment = None
+        if getattr(self, "_adp_kv_balance",
+                   False) and all_rank_states is not None:
+            kv_balanced = self._pop_kv_balanced_from_waiting_queue(
+                waiting_queue, total_num_active_requests, all_rank_states)
+            if kv_balanced is not None:
+                new_requests, kv_balanced_assignment = kv_balanced
+                if new_requests:
+                    logger.info_once(
+                        "Attention DP: KV-length-balanced admission in use "
+                        f"(window {self._adp_kv_balance_window}, max wait "
+                        f"rounds {self._adp_kv_balance_max_wait_iters})",
+                        key="adp_kv_balance_in_use")
+        if kv_balanced_assignment is None:
+            new_requests = self._pop_from_waiting_queue(
+                waiting_queue, total_num_active_requests,
+                all_ranks_num_active_requests)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -7210,10 +7291,18 @@ class PyExecutor:
             if self.adp_router.needs_prefix_matches and new_requests:
                 self.adp_router.gather_prefix_matches(new_requests)
 
-            all_ranks_new_requests, self.expected_num_active_requests = \
-                self.adp_router.route_requests(
-                    all_rank_states, new_requests,
+            if kv_balanced_assignment is not None:
+                all_ranks_new_requests = kv_balanced_assignment
+                self.expected_num_active_requests = min(
+                    max(num_active + len(all_ranks_new_requests[rank])
+                        for rank, num_active in enumerate(
+                            all_ranks_num_active_requests)),
                     self.max_num_active_requests)
+            else:
+                all_ranks_new_requests, self.expected_num_active_requests = \
+                    self.adp_router.route_requests(
+                        all_rank_states, new_requests,
+                        self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
@@ -8196,6 +8285,9 @@ class PyExecutor:
             return
         if not self.enable_attention_dp:
             return
+        if _is_single_rank_context_only_attention_dp(self.dist,
+                                                     self.kv_cache_manager):
+            return
 
         expected_num_active_requests = self.expected_num_active_requests
         num_routable_active_requests = len(self.active_requests)
@@ -8249,6 +8341,13 @@ class PyExecutor:
                            and num_active_request == 0)
         if not needs_dummy:
             return
+
+        if (self._adp_dummy_is_gen
+                and getattr(self.kv_cache_manager, "fp4_mla_context_only_cache",
+                            False) is True):
+            # A context-only FP4 MLA cache has no V sidecars, so a generation
+            # dummy fails in attention; pad with a context dummy instead.
+            self._adp_dummy_is_gen = False
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
         token_nums = None
@@ -8367,6 +8466,11 @@ class PyExecutor:
         # recovery while peers still need this owner to participate in forward.
         if self.expected_num_active_requests <= 0:
             return
+        # No peer waits on this rank (e.g. its active requests wait for an
+        # in-flight prefix or for KV cache): the empty batch skips the iteration.
+        if _is_single_rank_context_only_attention_dp(self.dist,
+                                                     self.kv_cache_manager):
+            return
         # This path can still hold active requests, so respect the same cap
         # that `_pad_attention_dp_dummy_request` asserts against.
         if len(self.active_requests) >= self.max_num_active_requests:
@@ -8381,10 +8485,13 @@ class PyExecutor:
                for request in self.active_requests):
             return
         # A KDA context-only cache manager keeps no replay or draft-verification
-        # buffers, so it cannot run a generation row; pad with a one-token
-        # context dummy instead.
-        context_dummy = getattr(self.kv_cache_manager, "kda_context_only",
-                                False) is True
+        # buffers, and an FP4 MLA context-only cache keeps no V sidecars, so
+        # neither can run a generation row; pad with a one-token context dummy
+        # instead.
+        context_dummy = (
+            getattr(self.kv_cache_manager, "kda_context_only", False) is True
+            or getattr(self.kv_cache_manager, "fp4_mla_context_only_cache",
+                       False) is True)
         token_nums = [1] if context_dummy else None
         if not self._has_adp_dummy_kv_capacity(
                 token_nums, draft_reserve=0 if context_dummy else None):
@@ -9081,6 +9188,9 @@ class PyExecutor:
                 sample_state = self.sampler.sample_async(
                     scheduled_batch, batch_outputs,
                     num_context_logits_prefix_sum)
+                draft_history_update = batch_outputs.get("draft_history_update")
+                if sample_state is not None and draft_history_update is not None:
+                    sample_state.draft_history_update = draft_history_update
                 self._maybe_record_hang_diagnostic_phase(
                     "sampling_returned", scheduled_batch)
                 return sample_state
@@ -9111,6 +9221,13 @@ class PyExecutor:
                          resource_manager: Optional[ResourceManager] = None):
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            draft_history_update = getattr(sample_state, "draft_history_update",
+                                           None)
+            if draft_history_update is not None:
+                # Before the KV of finished contexts is sent: the transfer
+                # carries the draft history.
+                draft_history_update.publish()
+                sample_state.draft_history_update = None
             self._accumulate_spec_dec_stats(sample_state)
         except Exception as e:
             traceback.print_exc()

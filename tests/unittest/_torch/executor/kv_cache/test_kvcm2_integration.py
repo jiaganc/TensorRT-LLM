@@ -159,6 +159,51 @@ def test_create_kv_cache_swa_endpoint_priority(
         assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_create_kv_cache_forwards_custom_priority_callback(is_dummy: bool) -> None:
+    """A caller's priority callback (a subclass's _context_priority_callback) reaches
+    the backend and takes the place of the SWA endpoint priority; dummies get none."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager._swa_endpoint_rewind = 1024
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.tokens_per_block = 32
+    manager.kv_cache_map = {}
+    manager.index_mapper = Mock()
+    manager.index_mapper.num_free_slots.return_value = 1
+    manager.max_beam_width = 1
+    manager.num_pools = 0
+    manager.impl = Mock()
+    manager.impl.create_kv_cache.return_value.beam_width = 1
+
+    def callback(_ordinal, _life_cycle):
+        return 0
+
+    manager._create_kv_cache(
+        0,
+        None,
+        None,
+        is_dummy=is_dummy,
+        expected_prompt_length=8192,
+        custom_priority_callback=callback,
+    )
+
+    kwargs = manager.impl.create_kv_cache.call_args.kwargs
+    if is_dummy:
+        assert "custom_priority_callback" not in kwargs
+    else:
+        assert kwargs["custom_priority_callback"] is callback
+
+
+@pytest.mark.cpu_only
+def test_context_priority_callback_defaults_to_none() -> None:
+    """The base manager keeps the backend's default page priorities."""
+    manager = object.__new__(KVCacheManagerV2)
+    assert manager._context_priority_callback(Mock()) is None
+
+
 def _commit_released_prompt(core: KVCacheManager, prompt: list[int], priority_callback) -> None:
     """Run a prompt through a real cache and release it, leaving its pages reusable."""
     cache = core.create_kv_cache(None, prompt, custom_priority_callback=priority_callback)

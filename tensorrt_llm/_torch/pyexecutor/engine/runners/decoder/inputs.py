@@ -19,6 +19,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import get_mrope_dummy_seq_slot
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.input_commit import active_input_commit, overlap_fixup_supported
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -32,6 +33,10 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
 from tensorrt_llm._torch.speculative import SpecMetadata, get_num_extra_kv_tokens
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
+from tensorrt_llm._torch.speculative.spec_head_kernels import (
+    fused_spec_head_prep,
+    spec_head_fusion_enabled,
+)
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import helix_local_len, set_per_request_prefill_cuda_graph_flag
@@ -1826,17 +1831,57 @@ class DecoderInputPreparer:
         assert total_num_tokens <= self._config.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )
+        # Set by the runner for a batched input commit (see input_commit.py).
+        input_commit = active_input_commit()
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
-            input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
-            self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self._buffers.input_ids_cuda[:num_tokens], input_ids)
+            else:
+                input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
+                self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         if num_draft_tokens > 0:
-            draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
-            self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
-                draft_tokens, non_blocking=True
+            if input_commit is not None:
+                input_commit.stage(self._buffers.draft_tokens_cuda[:num_draft_tokens], draft_tokens)
+            else:
+                draft_tokens = torch.tensor(
+                    draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
+                )
+                self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
+                    draft_tokens, non_blocking=True
+                )
+        if (
+            next_draft_tokens_device is not None
+            and input_commit is not None
+            and overlap_fixup_supported(
+                new_tokens_device, new_tokens_lens_device, next_draft_tokens_device
             )
-        if next_draft_tokens_device is not None:
+        ):
+            # The commit kernel performs the gathers below and writes every element of
+            # both offset buffers (zero outside the previous-step rows). It reads the
+            # previous slots from its arena, so the device index buffers and their
+            # staged-list caches are left as they are.
+            runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
+            num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
+            previous_begin = num_extend_reqeust_wo_dummy - previous_batch_len
+            input_commit.set_overlap_fixup(
+                previous_slots=previous_batch_indices,
+                tokens_per_req=runtime_tokens_per_gen_step,
+                draft_width=runtime_tokens_per_gen_step - 1,
+                new_tokens=new_tokens_device,
+                new_tokens_lens=new_tokens_lens_device,
+                next_draft_tokens=next_draft_tokens_device,
+                input_ids=self._buffers.input_ids_cuda,
+                input_ids_start=num_tokens,
+                draft_tokens=self._buffers.draft_tokens_cuda,
+                draft_tokens_start=num_draft_tokens,
+                pos_offsets=self._buffers.previous_pos_id_offsets_cuda,
+                pos_offsets_start=previous_begin * runtime_tokens_per_gen_step,
+                kv_offsets=self._buffers.previous_kv_lens_offsets_cuda,
+                kv_offsets_start=previous_begin,
+            )
+        elif next_draft_tokens_device is not None:
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
             num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
@@ -1981,6 +2026,15 @@ class DecoderInputPreparer:
     ) -> None:
         total_num_tokens = host.total_num_tokens
         position_ids = apply_position_id_offset(host.lists.position_ids, model=self.model)
+        input_commit = active_input_commit()
+        if input_commit is not None and not self._config.use_mrope:
+            # Batched input commit: staged, written right before the replay. The host
+            # tensor only serves host readers, so it needs no pinning.
+            host.host_position_ids = torch.tensor(position_ids, dtype=torch.int)
+            input_commit.stage(
+                self._buffers.position_ids_cuda[:total_num_tokens], host.host_position_ids
+            )
+            return
         host_position_ids = torch.tensor(position_ids, dtype=torch.int, pin_memory=prefer_pinned())
         # Use the (3,1,N) MRoPE layout whenever the model declares MRoPE, even
         # for text-only batches: keeping position_ids rank-consistent between
@@ -2427,6 +2481,15 @@ class DecoderInputPreparer:
         if attn_meta is not None:
             attn_meta.on_update_kv_lens()
 
+        if (
+            enable_spec_decode
+            and spec_head_fusion_enabled()
+            and self._fused_spec_head_prep(inputs, runtime_draft_len)
+        ):
+            if self.guided_decoder is not None:
+                self.guided_decoder.token_event.record()
+            return inputs
+
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_total_draft_tokens. But we need to use
@@ -2506,6 +2569,79 @@ class DecoderInputPreparer:
             self.guided_decoder.token_event.record()
 
         return inputs
+
+    def _fused_spec_head_prep(self, inputs: dict[str, Any], runtime_draft_len: int) -> bool:
+        """The device updates of ``preprocess_inputs`` in one kernel (``TLLM_SPEC_HEAD_FUSION=1``).
+
+        Covers the overlap-scheduler position / KV-length correction and the
+        Helix verify-group buffers (``recompute_helix_spec_buffers``) for int32
+        position ids and KV lengths, and writes the same values. Returns False,
+        having changed nothing, when the step needs the eager path.
+        """
+        md = inputs.get("attn_metadata")
+        if (
+            md is None
+            or md.kv_cache_manager is None
+            or not hasattr(md, "kv_lens_cuda")
+            or self._buffers.previous_pos_id_offsets_cuda is None
+        ):
+            return False
+        overlap = not self._config.disable_overlap_scheduler
+        helix = self.mapping.has_cp_helix() and getattr(md, "_helix_spec_tokens_valid", False)
+        position_ids = inputs["position_ids"]
+        if (
+            not (overlap or helix)
+            or position_ids.ndim != 2
+            or position_ids.dtype != torch.int32
+            or md.kv_lens_cuda.dtype != torch.int32
+        ):
+            return False
+        num_ctx_tokens = md.num_ctx_tokens
+        gen_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
+        num_ctx_requests = md.num_contexts
+        num_chunked = md.num_chunked_ctx_requests
+        if num_ctx_requests >= num_chunked and num_chunked > 0:
+            # Generation requests with draft tokens run as chunked context requests.
+            kv_start, num_kv = num_ctx_requests - num_chunked, num_chunked
+        else:
+            kv_start, num_kv = num_ctx_requests, md.num_generations
+        helix_kwargs = {}
+        if helix:
+            tokens_per_seq = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
+            # Same uniform-group contract as recompute_helix_spec_buffers.
+            assert gen_tokens % tokens_per_seq == 0, (
+                f"helix spec expects uniform verify groups: {gen_tokens} gen "
+                f"tokens not divisible by group size {tokens_per_seq}"
+            )
+            assert gen_tokens // tokens_per_seq == md.num_generations, (
+                f"helix spec expects uniform verify groups: {gen_tokens} gen "
+                f"tokens over {md.num_generations} generation rows do not all "
+                f"have width {tokens_per_seq}"
+            )
+            helix_kwargs = dict(
+                helix_positions=md.helix_position_offsets,
+                helix_slots=md.helix_local_slots,
+                helix_bounds=md.helix_kv_bounds,
+                num_helix=gen_tokens,
+                tokens_per_block=md.kv_cache_manager.tokens_per_block,
+                cp_size=md.mapping.cp_size,
+                cp_rank=md.mapping.cp_rank,
+                kv_bound_start=md.num_contexts,
+                tokens_per_seq=tokens_per_seq,
+            )
+        fused_spec_head_prep(
+            position_ids[0, num_ctx_tokens:],
+            self._buffers.previous_pos_id_offsets_cuda,
+            gen_tokens,
+            md.kv_lens_cuda,
+            self._buffers.previous_kv_lens_offsets_cuda,
+            kv_start,
+            num_kv,
+            has_overlap=overlap,
+            **helix_kwargs,
+        )
+        md.on_update_kv_lens()
+        return True
 
     def postprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int

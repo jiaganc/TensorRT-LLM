@@ -23,6 +23,9 @@ from unittest.mock import Mock, call, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
+from tensorrt_llm._torch.pyexecutor.kv_cache import (
+    kv_cache_manager_v2 as kv_cache_manager_v2_module,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -5306,3 +5309,231 @@ class TestLongContextDemotion:
             assert ids(out.context_requests) == [long_id]
         else:
             assert ids(out.recompute_paused_requests) == [long_id]
+
+
+class TestLongContextDemotionExact:
+    """TLLM_V2_CTX_DEMOTE_EXACT=1: the demotion classifies by the prefix cache.
+    An estimate above the threshold is probed once against the radix tree, a
+    request whose cache is held is judged by its exact remainder, and one
+    ordered as short whose first prepare shows a long remainder is deferred."""
+
+    ENV = {
+        "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1024",
+        "TLLM_V2_CTX_DEMOTE_MAX_ITERS": "0",
+        "TLLM_V2_CTX_DEMOTE_EXACT": "1",
+    }
+
+    def _make(self, env=None, reused=None, prepared_remaining=None):
+        """`reused`: probe result per request id. `prepared_remaining`: the exact
+        remainder prepare_context leaves per request id (its claimed reuse)."""
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        reused = reused or {}
+        prepared_remaining = prepared_remaining or {}
+
+        def prepare(req, reuse_limit=None):
+            mgr.kv_cache_map[req.py_request_id]  # the request now holds a cache
+            if req.py_request_id in prepared_remaining:
+                req.context_remaining_length = prepared_remaining[req.py_request_id]
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.probe_context_reuse.side_effect = lambda req: reused.get(req.py_request_id)
+        with patch.dict("os.environ", env or self.ENV):
+            sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        return sched, mgr
+
+    def _req(self, request_id, remaining, estimate, prompt_len=None):
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, prompt_len=prompt_len
+        )
+        req.py_uncached_prefill_tokens = estimate
+        req.py_uncached_prefill_probed = False
+        return req
+
+    def test_off_by_default(self):
+        sched, mgr = self._make(env=dict(self.ENV, TLLM_V2_CTX_DEMOTE_EXACT="0"), reused={1: 9_800})
+        long_req, forked = self._req(0, 10_000, 10_000), self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([long_req, forked], set())
+        assert ids(out.context_requests) == [0]
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_probe_releases_a_request_over_a_cached_prefix(self):
+        """A forked sub-agent: unseen conversation, so the router estimates the
+        whole prompt, but 9800 of its 10000 tokens are cached."""
+        sched, mgr = self._make(reused={0: 0, 1: 9_800}, prepared_remaining={1: 200})
+        long_req, forked = self._req(0, 10_000, 10_000), self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([long_req, forked], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert forked.py_uncached_prefill_tokens == 200
+        assert forked.context_chunk_size == 200
+        assert long_req.context_chunk_size == 768  # leftover 824, rounded to the chunk unit
+        # One probe per request: the second iteration reuses the refined estimates.
+        sched.schedule_request([long_req], set())
+        assert mgr.probe_context_reuse.call_count == 2
+
+    def test_held_cache_is_judged_by_its_exact_remainder(self):
+        """A continuing turn whose prefix was evicted: the router estimates 256,
+        but the cache it holds leaves 10000 tokens to prefill."""
+        sched, mgr = self._make()
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        mgr.kv_cache_map[0]
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert lost.context_chunk_size == 768
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_first_prepare_defers_a_request_found_long(self):
+        """Deferred to the tail of the iteration's context order; its released
+        first-chunk admission is prepared again there."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000})
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert short.context_chunk_size == 256
+        assert lost.context_chunk_size == 768
+        assert sched._ctx_demote_skips == {0: 1}  # counted as demoted for aging
+        assert mgr.prepare_context.call_count == 3  # lost twice (deferred, retried), short once
+        # The deferral released the first-chunk admission before the retry.
+        mgr.free_resources.assert_called_once_with(lost)
+
+    def test_request_found_short_is_not_deferred(self):
+        sched, _ = self._make(prepared_remaining={0: 512})
+        first, second = self._req(0, 512, 512), self._req(1, 256, 256)
+        out = sched.schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert sched._ctx_demote_skips == {}
+
+    def test_waiting_request_is_probed_again(self):
+        """A request waiting for an in-flight prefix (TRTLLM_KV_V2_WAIT_FOR_INFLIGHT_PREFIX)
+        is probed again once it stops waiting: its first probe predates that prefix."""
+        reused = {1: 0}
+        sched, mgr = self._make(reused=reused, prepared_remaining={1: 200})
+        sched._wait_for_inflight_prefix = True
+        mgr.plan_context_waits.side_effect = lambda reqs: {1}
+        waiting = self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([waiting], set())
+        assert ids(out.context_requests) == []
+        assert waiting.py_uncached_prefill_tokens == 10_000
+        assert not waiting.py_uncached_prefill_probed
+        # The prefix owner committed 9800 shared tokens; the waiter is released.
+        reused[1] = 9_800
+        mgr.plan_context_waits.side_effect = lambda reqs: set()
+        out = sched.schedule_request([waiting], set())
+        assert ids(out.context_requests) == [1]
+        assert waiting.py_uncached_prefill_tokens == 200
+        assert waiting.context_chunk_size == 200
+        assert mgr.probe_context_reuse.call_count == 2
+
+
+class TestUnscheduledFirstChunkClaim:
+    """TLLM_V2_KEEP_UNSCHEDULED_FIRST_CHUNK_CLAIM=1: a first context chunk that is
+    not scheduled keeps its cache claim unless admission ran out of KV pages. By
+    default every unscheduled first chunk that holds a claim releases it. Both
+    are counted per schedule action."""
+
+    DEMOTE_ENV = {
+        "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1024",
+        "TLLM_V2_CTX_DEMOTE_MAX_ITERS": "0",
+        "TLLM_V2_CTX_DEMOTE_EXACT": "1",
+    }
+
+    def _make(self, keep, prepared_remaining=None, resize_context_fn=None):
+        mgr = make_kv_cache_manager(tokens_per_block=64, resize_context_fn=resize_context_fn)
+        prepared_remaining = prepared_remaining or {}
+
+        def prepare(req, reuse_limit=None):
+            mgr.kv_cache_map[req.py_request_id]  # the request now holds a cache
+            if req.py_request_id in prepared_remaining:
+                req.context_remaining_length = prepared_remaining[req.py_request_id]
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id)
+        env = dict(self.DEMOTE_ENV, TLLM_V2_KEEP_UNSCHEDULED_FIRST_CHUNK_CLAIM="1" if keep else "0")
+        with patch.dict("os.environ", env):
+            sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        return sched, mgr
+
+    @staticmethod
+    def _req(request_id, remaining, estimate):
+        req = make_ctx_request(request_id, context_remaining_length=remaining)
+        req.py_uncached_prefill_tokens = estimate
+        req.py_uncached_prefill_probed = False
+        return req
+
+    @pytest.mark.parametrize("keep", [False, True], ids=["release", "keep"])
+    def test_deferred_first_chunk(self, keep):
+        """A request ordered as short and found long is deferred to the tail of
+        the iteration either way; only the default releases its claim first."""
+        sched, mgr = self._make(keep, prepared_remaining={0: 10_000})
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert lost.context_chunk_size == 768
+        assert sched._unscheduled_first_chunk_claims == {("defer", False, not keep): 1}
+        if keep:
+            mgr.free_resources.assert_not_called()
+        else:
+            mgr.free_resources.assert_called_once_with(lost)
+
+    def test_kept_claim_is_judged_by_its_exact_remainder_next_pass(self):
+        """A kept claim is not matched again: the next pass orders the request by
+        the remainder its held cache leaves, so it is demoted without a deferral."""
+        sched, mgr = self._make(True, prepared_remaining={0: 10_000})
+        lost, short = self._req(0, 10_000, 256), self._req(1, 1024, 1024)
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1]  # the short one takes the whole budget
+        out = sched.schedule_request([lost], set())
+        assert ids(out.context_requests) == [0]
+        assert lost.context_chunk_size == 1024
+        assert sched._ctx_demote_skips == {0: 2}  # deferred in pass 1, demoted in pass 2
+        assert sched._unscheduled_first_chunk_claims == {("defer", False, False): 1}
+        mgr.free_resources.assert_not_called()
+        mgr.probe_context_reuse.assert_not_called()
+
+    @pytest.mark.parametrize("keep", [False, True], ids=["release", "keep"])
+    def test_out_of_pages_releases(self, keep):
+        sched, mgr = self._make(keep, resize_context_fn=lambda req, n: False)
+        req = self._req(0, 256, 256)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == []
+        mgr.free_resources.assert_called_once_with(req)
+        assert sched._unscheduled_first_chunk_claims == {("skip", True, True): 1}
+
+    def test_no_claim_is_not_counted(self):
+        """A first chunk skipped before prepare_context holds nothing to release."""
+        sched, mgr = self._make(True)
+        mgr.prepare_context.side_effect = lambda req, reuse_limit=None: False
+        out = sched.schedule_request([self._req(0, 256, 256)], set())
+        assert ids(out.context_requests) == []
+        assert sched._unscheduled_first_chunk_claims == {}
+
+
+# ===========================================================================
+# Waiting for an in-flight prefix
+# ===========================================================================
+
+
+class TestInflightPrefixWait:
+    """TRTLLM_KV_V2_WAIT_FOR_INFLIGHT_PREFIX: a new context request the manager
+    plans to wait (plan_context_waits) stays queued this pass, without a cache
+    claim; the requests behind it are scheduled."""
+
+    @pytest.mark.parametrize("chunk_config", [(None, 64), None])
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_waiting_request_is_skipped_without_preparing(self, chunk_config, enabled):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.plan_context_waits.side_effect = lambda reqs: {1}
+        with patch.object(kv_cache_manager_v2_module, "_WAIT_FOR_INFLIGHT_PREFIX", enabled):
+            sched = make_scheduler(mgr, max_num_tokens=4096, ctx_chunk_config=chunk_config)
+        reqs = [make_ctx_request(i, context_remaining_length=500) for i in range(3)]
+
+        out = sched.schedule_request(reqs, set())
+
+        scheduled = ids(out.context_requests)
+        prepared = [c.args[0].py_request_id for c in mgr.prepare_context.call_args_list]
+        if enabled:
+            assert scheduled == [0, 2] and 1 not in prepared
+        else:
+            assert scheduled == [0, 1, 2]
+            mgr.plan_context_waits.assert_not_called()

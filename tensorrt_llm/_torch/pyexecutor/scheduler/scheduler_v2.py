@@ -15,6 +15,7 @@
 
 import enum
 import os
+import time
 from collections import Counter
 from typing import Callable, Optional
 
@@ -38,6 +39,10 @@ from .scheduler import (
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
 
+# "1": an unscheduled first context chunk keeps its cache claim unless admission
+# ran out of KV pages (see KVCacheV2Scheduler.__init__).
+KEEP_UNSCHEDULED_FIRST_CHUNK_CLAIM_ENV = "TLLM_V2_KEEP_UNSCHEDULED_FIRST_CHUNK_CLAIM"
+
 
 class ScheduleAction(enum.Enum):
     """Result of a per-request scheduling attempt."""
@@ -45,6 +50,7 @@ class ScheduleAction(enum.Enum):
     SCHEDULED = "scheduled"  # success — payload contains tokens etc.
     SKIP = "skip"  # skip this request, continue the loop
     STOP = "stop"  # stop the scheduling loop
+    DEFER = "defer"  # retry this request after the rest of this iteration's order
 
 
 class _RecomputePauseState:
@@ -179,12 +185,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
         )
+        from ..kv_cache import kv_cache_manager_v2
         from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         assert isinstance(kv_cache_manager, KVCacheManagerV2), (
             f"KVCacheV2Scheduler requires KVCacheManagerV2, got {type(kv_cache_manager).__name__}"
         )
         self.kv_cache_manager = kv_cache_manager
+        # TRTLLM_KV_V2_WAIT_FOR_INFLIGHT_PREFIX: ask the manager which new
+        # context requests wait for a prefix another request computes.
+        self._wait_for_inflight_prefix = kv_cache_manager_v2._WAIT_FOR_INFLIGHT_PREFIX
         self.draft_kv_cache_manager = draft_kv_cache_manager
         self.enable_joint_kv_cache_reuse = kv_cache_manager.enable_joint_kv_cache_reuse
         # The draft pool to keep in lockstep with the target, or None when
@@ -280,11 +290,47 @@ class KVCacheV2Scheduler(RequestScheduler):
             0, int(os.environ.get("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "0"))
         )
         self._ctx_demote_skips: dict[int, int] = {}
+        # Opt-in (default off): classify by the prefix cache, not by the router's
+        # estimate alone. The router only knows the conversation's previous prompt
+        # length on this rank, so it calls a forked sub-agent or a new conversation
+        # over a cached shared prefix long, and a continuing turn whose prefix was
+        # evicted short (which then takes the whole budget for every chunk). With
+        # this on, an estimate above the threshold is checked once against the
+        # radix tree (read-only probe, one walk per request), a request whose
+        # cache this pool already holds is judged by its exact remainder, and a
+        # request ordered as short whose first prepare shows a long remainder
+        # goes behind the rest of the iteration.
+        self._ctx_demote_exact = (
+            self._ctx_demote_uncached_tokens > 0
+            and os.environ.get("TLLM_V2_CTX_DEMOTE_EXACT", "0") == "1"
+        )
+        # First-chunk requests ordered as short on the estimate alone this iteration.
+        self._ctx_unverified_short: set[int] = set()
+        # Opt-in (default off): a first context chunk that is not scheduled keeps
+        # its cache claim unless admission ran out of KV pages. By default every
+        # unscheduled first chunk releases its claim (release_context_admission),
+        # so a request that waits for token budget, or is deferred to the tail of
+        # the iteration, matches its prefix again on its next pass.
+        self._keep_unscheduled_first_chunk_claim = (
+            os.environ.get(KEEP_UNSCHEDULED_FIRST_CHUNK_CLAIM_ENV, "0") == "1"
+        )
+        # Set by the context admission paths when the request found no KV pages.
+        self._admission_out_of_pages = False
+        # Unscheduled first chunks that held a cache claim, keyed by
+        # (schedule action, out of pages, released); logged at INFO.
+        self._unscheduled_first_chunk_claims: Counter = Counter()
+        self._unscheduled_first_chunk_claims_logged_at = 0.0
+        if self._keep_unscheduled_first_chunk_claim:
+            logger.info(
+                "KVCacheV2Scheduler: unscheduled first context chunks keep their cache "
+                "claim unless admission ran out of KV pages"
+            )
         if self._ctx_demote_uncached_tokens:
             logger.info(
                 f"KVCacheV2Scheduler: demoting context requests with more than "
                 f"{self._ctx_demote_uncached_tokens} uncached tokens left "
-                f"(max iterations demoted: {self._ctx_demote_max_iters or 'unbounded'})"
+                f"(max iterations demoted: {self._ctx_demote_max_iters or 'unbounded'}, "
+                f"exact: {self._ctx_demote_exact})"
             )
 
         # Registered by PyExecutor; see set_async_transfer_manager.
@@ -650,9 +696,30 @@ class KVCacheV2Scheduler(RequestScheduler):
                 ),
             )
 
-        for req in pending_ctx:
+        # New context requests that wait this pass for a prefix another request
+        # is prefilling (see KVCacheManagerV2.plan_context_waits).
+        waiting_ids = (
+            self.kv_cache_manager.plan_context_waits(pending_ctx)
+            if self._wait_for_inflight_prefix
+            else ()
+        )
+        if self._ctx_demote_exact and waiting_ids:
+            # The probe of a waiting request predates the prefix it waits for;
+            # it is probed again once it stops waiting.
+            for req in pending_ctx:
+                if req.py_request_id in waiting_ids:
+                    req.py_uncached_prefill_probed = False
+
+        # Indexed over a copy: a DEFER re-appends its request to the tail.
+        ctx_order = list(pending_ctx)
+        ctx_idx = 0
+        while ctx_idx < len(ctx_order):
+            req = ctx_order[ctx_idx]
+            ctx_idx += 1
             if budget.requests_full:
                 break
+            if req.py_request_id in waiting_ids:
+                continue
             # A radix probe cannot affect admission once the chunk token budget
             # is exhausted. Keep scanning: an encoder request may still fit.
             if (
@@ -715,6 +782,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
+                    continue
+                if action is ScheduleAction.DEFER:
+                    # Ordered as short, prepared, found long: it goes behind the
+                    # rest of this iteration and counts as demoted for aging.
+                    demoted_ids.add(req.py_request_id)
+                    ctx_order.append(req)
                     continue
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
@@ -787,25 +860,44 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Whether the router's uncached-prefill estimate exceeds the threshold
         and, once mid-prefill, more than the threshold is actually left. A
         request without an estimate (none published, or dropped by the aging
-        bound) is never long. No radix probe here: it would walk the whole
-        prompt for every request on every iteration."""
+        bound) is never long. No radix probe here unless
+        TLLM_V2_CTX_DEMOTE_EXACT is on (then at most one per request): it would
+        walk the whole prompt for every request on every iteration."""
         if req.state_value == self._encoder_init_state_value:
             return False
         estimate = req.py_uncached_prefill_tokens
-        if estimate is None or estimate <= self._ctx_demote_uncached_tokens:
+        if estimate is None:
             return False
-        return not (
-            req.context_current_position > 0
-            and req.context_remaining_length <= self._ctx_demote_uncached_tokens
-        )
+        threshold = self._ctx_demote_uncached_tokens
+        if self._ctx_demote_exact:
+            if req.context_current_position > 0 or self._holds_context_cache(req):
+                return req.context_remaining_length > threshold
+            if estimate > threshold and not req.py_uncached_prefill_probed:
+                req.py_uncached_prefill_probed = True
+                reused = self.kv_cache_manager.probe_context_reuse(req)
+                if reused is not None:
+                    estimate = max(req.prompt_len - reused, 0)
+                    req.py_uncached_prefill_tokens = estimate
+            return estimate > threshold
+        if estimate <= threshold:
+            return False
+        return not (req.context_current_position > 0 and req.context_remaining_length <= threshold)
+
+    def _holds_context_cache(self, req: LlmRequest) -> bool:
+        """Whether prepare_context already ran for this request: its reuse is claimed,
+        so context_remaining_length is the exact uncached remainder."""
+        return req.py_request_id in self.kv_cache_manager.kv_cache_map
 
     def _defer_long_context(self, pending_ctx: RequestList) -> tuple[RequestList, set[int]]:
         """Move long requests to the tail of this iteration's context order.
 
-        Returns the new order and the ids demoted.
+        Returns the new order and the ids demoted. In exact mode also records
+        which requests were kept on the estimate alone (see
+        _try_schedule_context_chunked).
         """
         keep: RequestList = []
         deferred: RequestList = []
+        self._ctx_unverified_short = set()
         for req in pending_ctx:
             if self._is_long_context(req):
                 aged_out = (
@@ -823,6 +915,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # skipped, not suspended, so enough of them fill the pool and
                 # no context request can allocate.
                 req.py_uncached_prefill_tokens = None
+            elif (
+                self._ctx_demote_exact
+                and req.py_uncached_prefill_tokens is not None
+                and req.context_current_position == 0
+                and not self._holds_context_cache(req)
+            ):
+                self._ctx_unverified_short.add(req.py_request_id)
             keep.append(req)
         return keep + deferred, {req.py_request_id for req in deferred}
 
@@ -999,17 +1098,43 @@ class KVCacheV2Scheduler(RequestScheduler):
         A loading request remains outside the schedulable state range.
         """
         first_chunk = req.is_first_context_chunk
+        self._admission_out_of_pages = False
         if self.chunking_enabled:
             result = self._try_schedule_context_chunked(req, budget, preempt_for_pages)
         else:
             result = self._try_schedule_context_full(req, budget, preempt_for_pages)
 
         if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
-            # Failed admission must not retain prefix-reuse holds. Suspension
-            # alone cannot release them when the last cache tier is full.
-            self.release_context_admission(req)
+            release = self._admission_out_of_pages or not self._keep_unscheduled_first_chunk_claim
+            if self._holds_context_cache(req):
+                self._count_unscheduled_first_chunk_claim(result[0], release)
+            if release:
+                # Failed admission must not retain prefix-reuse holds. Suspension
+                # alone cannot release them when the last cache tier is full.
+                self.release_context_admission(req)
 
         return result
+
+    def _count_unscheduled_first_chunk_claim(self, action: ScheduleAction, released: bool) -> None:
+        """Count a first chunk that held a cache claim and was not scheduled.
+
+        Logged at INFO at most once a minute: each released claim is matched
+        against the radix tree again on the request's next pass.
+        """
+        key = (action.value, self._admission_out_of_pages, released)
+        self._unscheduled_first_chunk_claims[key] += 1
+        now = time.monotonic()
+        if now - self._unscheduled_first_chunk_claims_logged_at < 60.0:
+            return
+        self._unscheduled_first_chunk_claims_logged_at = now
+        counts = " ".join(
+            f"{action_value}/{'pages' if out_of_pages else 'other'}/"
+            f"{'released' if was_released else 'kept'}={count}"
+            for (action_value, out_of_pages, was_released), count in sorted(
+                self._unscheduled_first_chunk_claims.items()
+            )
+        )
+        logger.info(f"KVCacheV2Scheduler: unscheduled first context chunks with a claim {counts}")
 
     def release_context_admission(self, req: LlmRequest) -> None:
         """Free a first-chunk context's caches in every pool and rewind its cursor.
@@ -1052,6 +1177,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # before budget check.
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for context request {req.py_request_id}")
+            self._admission_out_of_pages = True
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
@@ -1076,12 +1202,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             # proceed, and retry next iteration: a failed resize leaves a
             # first chunk suspended, so the retry has to go back through
             # prepare_context to resume it.
+            self._admission_out_of_pages = True
             if preempt_for_pages(req):
                 return ScheduleAction.STOP, 0, False
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
         if cross_action is not ScheduleAction.SCHEDULED:
+            self._admission_out_of_pages = True
             self._suspend_request(req)
             return cross_action, 0, False
 
@@ -1141,7 +1269,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
+            self._admission_out_of_pages = True
             return ScheduleAction.SKIP, 0, False
+
+        if req.py_request_id in self._ctx_unverified_short:
+            # Ordered as short on the router's estimate alone; the reuse claimed
+            # just now makes the remainder exact. Once per request per iteration.
+            # Unless it keeps its claim (KEEP_UNSCHEDULED_FIRST_CHUNK_CLAIM_ENV),
+            # a first chunk that is not scheduled releases its admission, so the
+            # retry matches its prefix again.
+            self._ctx_unverified_short.discard(req.py_request_id)
+            if self._is_long_context(req):
+                return ScheduleAction.DEFER, 0, False
 
         # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
@@ -1242,12 +1381,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # draft tokens for last chunk.
         if not self._try_allocate_context(req, resize_tokens):
             # Out of pages, as in _try_schedule_context_full.
+            self._admission_out_of_pages = True
             if preempt_for_pages(req):
                 return ScheduleAction.STOP, 0, False
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
         if cross_action is not ScheduleAction.SCHEDULED:
+            self._admission_out_of_pages = True
             self._suspend_request(req)
             return cross_action, 0, False
 

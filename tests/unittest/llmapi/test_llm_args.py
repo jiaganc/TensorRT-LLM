@@ -534,6 +534,22 @@ def test_dspark_block_size_resolved_from_checkpoint(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_dspark_context_kv_fields():
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5)
+    assert spec_cfg.context_kv_only is False
+    assert spec_cfg.context_kv_dtype == "auto"
+
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    context_kv_only=True,
+                                    context_kv_dtype="fp8")
+    assert spec_cfg.context_kv_only is True
+    assert spec_cfg.context_kv_dtype == "fp8"
+
+    with pytest.raises(ValueError):
+        DSparkDecodingConfig(max_draft_len=5, context_kv_dtype="bf16")
+
+
+@pytest.mark.cpu_only
 def test_dspark_block_size_must_match_max_draft_len(tmp_path):
     (tmp_path / "config.json").write_text('{"dspark_block_size": 4}')
     spec_cfg = DSparkDecodingConfig(max_draft_len=5,

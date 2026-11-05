@@ -24,3 +24,15 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/moe
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/quantization
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec
+  # The Kimi K3 Rubin target's unit tests, one entry per op directory plus its two
+  # top-level files. Its comm test (MNNVL all-reduce) runs several ranks and, like
+  # GLM's, waits for a multi-GPU GR100 stage. Its cpu_only cases are in l0_cpu.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kda
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/moe
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/test_k3_engine_probes.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/test_k3_ull_shared_fork.py
+  # CuTe DSL FC12 with presorted tokens runs on SM107 only.
+  - unittest/_torch/moe/test_cute_dsl_fc12_presorted.py

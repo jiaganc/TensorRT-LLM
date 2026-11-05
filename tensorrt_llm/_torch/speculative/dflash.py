@@ -530,6 +530,16 @@ def dflash_allocated_ctx_limit(
     return (block_counts * page_size - block_size).clamp(min=0)
 
 
+def _uses_unified_draft_cache(worker) -> bool:
+    """Whether ``worker`` keeps its context in the KV cache manager's draft layers.
+
+    Its slots then follow the manager's draft history, assigned in
+    ``prepare_managed_draft_cache`` rather than in ``DFlashSpecMetadata.prepare``.
+    """
+    has_unified = getattr(worker, "_has_unified_draft_cache", None)
+    return has_unified is not None and has_unified()
+
+
 @dataclass
 class DFlashSpecMetadata(SpecMetadata):
     """Metadata for DFlash speculative decoding.
@@ -548,6 +558,15 @@ class DFlashSpecMetadata(SpecMetadata):
     max_num_tokens: int = 0
     dtype: torch.dtype = torch.bfloat16
     captured_hidden_states: Optional[torch.Tensor] = None
+    # Fold the drafter's capture projection (fc) into the capture: each captured
+    # layer adds its fc column block's product to one FP32 [max_num_tokens,
+    # fc out_features] accumulator (projected_captures) instead of keeping
+    # [max_num_tokens, hidden_size] per layer. For a drafter that reads the
+    # captures only through fc, such as a context-KV-only drafter. The
+    # projection is bound before every forward (bind_capture_projection); a
+    # drafter that cannot provide one gets the plain capture buffer.
+    project_captures: bool = False
+    projected_captures: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         self._batch_indices_buffer = DeviceCopyBuffer(
@@ -561,6 +580,13 @@ class DFlashSpecMetadata(SpecMetadata):
         # Log the capture-dtype notice once per metadata object, not once per
         # layer per forward.
         self._warned_capture_dtype = False
+        # Per captured layer, the fc column block project_captures multiplies by.
+        self._capture_projection: Optional[List[torch.Tensor]] = None
+        # projected_captures by width, shared with the shallow copies that
+        # create_cuda_graph_metadata makes, so every graph bucket accumulates
+        # into one buffer whichever metadata binds the projection first.
+        if getattr(self, "_projected_captures_by_width", None) is None:
+            self._projected_captures_by_width: dict[int, torch.Tensor] = {}
 
         # Set up hidden state capture buffer
         if self.layers_to_capture is not None and len(self.layers_to_capture) > 0:
@@ -569,27 +595,84 @@ class DFlashSpecMetadata(SpecMetadata):
             # O(1) lookups for is_layer_capture() and maybe_capture_hidden_states()
             self._capture_layer_set = frozenset(self.layers_to_capture)
             self._layer_to_idx = {lid: i for i, lid in enumerate(self.layers_to_capture)}
-            # Graph metadata is shallow-copied and initialized for each bucket.
-            # Keep the full token-budget scratch buffer shared: model forwards
-            # and their consumers are ordered on the same execution stream.
-            expected_shape = (self.max_num_tokens, self.hidden_size * self.num_capture_layers)
-            if (
-                self.captured_hidden_states is None
-                or self.captured_hidden_states.shape != expected_shape
-                or self.captured_hidden_states.dtype != self.dtype
-                or self.captured_hidden_states.device != self.batch_indices_cuda.device
-            ):
-                self.captured_hidden_states = torch.empty(
-                    expected_shape, dtype=self.dtype, device=self.batch_indices_cuda.device
-                )
-                logger.info(
-                    f"DFlash: capturing hidden states from layers {self.layers_to_capture}, "
-                    f"buffer shape {self.captured_hidden_states.shape}"
-                )
+            if not self.project_captures:
+                self._allocate_capture_buffer()
         else:
             self.num_capture_layers = 0
             self._capture_layer_set = frozenset()
             self._layer_to_idx = {}
+
+    def _allocate_capture_buffer(self) -> None:
+        # Graph metadata is shallow-copied and initialized for each bucket.
+        # Keep the full token-budget scratch buffer shared: model forwards
+        # and their consumers are ordered on the same execution stream.
+        expected_shape = (self.max_num_tokens, self.hidden_size * self.num_capture_layers)
+        if (
+            self.captured_hidden_states is None
+            or self.captured_hidden_states.shape != expected_shape
+            or self.captured_hidden_states.dtype != self.dtype
+            or self.captured_hidden_states.device != self.batch_indices_cuda.device
+        ):
+            self.captured_hidden_states = torch.empty(
+                expected_shape, dtype=self.dtype, device=self.batch_indices_cuda.device
+            )
+            logger.info(
+                f"DFlash: capturing hidden states from layers {self.layers_to_capture}, "
+                f"buffer shape {self.captured_hidden_states.shape}"
+            )
+
+    def bind_capture_projection(self, blocks: Optional[List[torch.Tensor]]) -> None:
+        """Set the fc column blocks ``project_captures`` accumulates with.
+
+        Called before every forward, so a reloaded fc weight is picked up. A
+        no-op unless ``project_captures`` is set.
+
+        Args:
+            blocks: One ``[out_features, hidden_size]`` weight block per
+                captured layer, in ``layers_to_capture`` order, such that the
+                projection of the concatenated captures is
+                ``sum_i hidden_i @ blocks[i].T``. None keeps the plain capture
+                buffer.
+        """
+        if not self.project_captures or self.num_capture_layers == 0:
+            return
+        if blocks is None:
+            self._capture_projection = None
+            self._allocate_capture_buffer()
+            return
+        if len(blocks) != self.num_capture_layers or any(
+            block.shape[1] != self.hidden_size for block in blocks
+        ):
+            raise ValueError(
+                f"DFlash: the capture projection has {len(blocks)} blocks of "
+                f"{[tuple(block.shape) for block in blocks]}, expected "
+                f"{self.num_capture_layers} of [*, {self.hidden_size}]."
+            )
+        out_features = blocks[0].shape[0]
+        projected = self._projected_captures_by_width.get(out_features)
+        if projected is None:
+            projected = torch.empty(
+                (self.max_num_tokens, out_features),
+                dtype=torch.float32,
+                device=self.batch_indices_cuda.device,
+            )
+            self._projected_captures_by_width[out_features] = projected
+            logger.info(
+                f"DFlash: projecting the captures of layers {self.layers_to_capture} "
+                f"into an FP32 buffer of shape {tuple(projected.shape)}"
+            )
+        self.projected_captures = projected
+        self._capture_projection = list(blocks)
+
+    def get_projected_captures(self, num_tokens: int) -> Optional[torch.Tensor]:
+        """FP32 ``[num_tokens, out_features]`` fc of this forward's captures.
+
+        None unless ``project_captures`` bound a projection; the captures are
+        then in ``get_hidden_states`` instead.
+        """
+        if self._capture_projection is None:
+            return None
+        return self.projected_captures[:num_tokens]
 
     def prepare(self):
         assert self.request_ids is not None
@@ -599,7 +682,7 @@ class DFlashSpecMetadata(SpecMetadata):
 
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
-        if worker is not None and worker._ctx_buf_inited:
+        if worker is not None and worker._ctx_buf_inited and not _uses_unified_draft_cache(worker):
             current = set(self.request_ids)
             evicted = {}
             for rid in list(worker._req_to_slot.keys()):
@@ -654,8 +737,37 @@ class DFlashSpecMetadata(SpecMetadata):
         so convert to the buffer dtype on capture. The drafter consumes
         buffer-dtype-rounded values, so capturing anything wider would shift
         acceptance length.
+
+        With a bound ``project_captures`` projection the layer's fc partial is
+        accumulated instead. Captured layers run in ascending order, so the
+        first one overwrites the accumulator and the others add to it.
         """
+        if self._capture_projection is not None:
+            i = self._layer_to_idx.get(layer_id)
+            if i is None:
+                return
+            to_save = hidden_states + residual if residual is not None else hidden_states
+            block = self._capture_projection[i]
+            to_save = to_save.to(block.dtype)
+            out = self.projected_captures[: to_save.shape[0]]
+            # FP32 output of the BF16 GEMM, summed in FP32 across the captured
+            # layers in the GEMM epilogue: the single fc GEMM's accumulation,
+            # in another order.
+            torch.addmm(
+                out,
+                to_save,
+                block.t(),
+                out_dtype=torch.float32,
+                beta=0 if i == 0 else 1,
+                out=out,
+            )
+            return
         if self.captured_hidden_states is None:
+            if self.project_captures and layer_id in self._capture_layer_set:
+                raise RuntimeError(
+                    "DFlash: project_captures needs bind_capture_projection before the "
+                    "first forward."
+                )
             return
         i = self._layer_to_idx.get(layer_id)
         if i is not None:

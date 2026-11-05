@@ -252,16 +252,15 @@ def validate_fp4_mla_config(model_config: ModelConfig,
             and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
         return
     if not supports_fp4_mla_attention(model_config):
-        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend; "
-                         "hybrid linear attention is not supported.")
-    if model_config.mapping.cp_size != 1:
-        raise ValueError("FP4 MLA does not support context parallelism.")
+        raise ValueError(
+            "Dense FP4 MLA requires the TRTLLM attention backend; among hybrid "
+            "linear-attention models only Kimi K3 is supported.")
+    if model_config.mapping.cp_size != 1 and not model_config.mapping.has_cp_helix(
+    ):
+        raise ValueError("FP4 MLA supports context parallelism only with Helix "
+                         "(cp_config cp_type=HELIX).")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
         raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
-    if llm_args.enable_chunked_prefill:
-        raise ValueError(
-            "FP4 MLA does not support chunked prefill or cached context; "
-            "set enable_chunked_prefill=False.")
 
     spec_config = model_config.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():

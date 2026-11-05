@@ -2634,6 +2634,7 @@ class _StubADPExecutor:
         enable_non_overlap_adp_forward_intent=None,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
         exclude_retiring_requests=True,
+        tp_size=1,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -2663,7 +2664,9 @@ class _StubADPExecutor:
         self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
 
         self.dist = Mock()
-        self.dist.tp_size = 1
+        # Peers are modeled by peer_forward_intent; tp_size only says whether
+        # the attention-DP group has any peer at all.
+        self.dist.tp_size = tp_size
         self.dist.cp_size = 1
         self.dist.tp_rank = 0
         self.dist.tp_allgather.side_effect = lambda value: [value]
@@ -3208,6 +3211,20 @@ def test_legacy_pad_dummy_allocation_failure_skips_padding(failure):
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 
 
+def test_adp_pad_dummy_is_context_on_fp4_mla_context_only_worker():
+    # A peer's generation intent must not give a single-copy FP4 MLA context
+    # worker a generation dummy: its cache has no V sidecars.
+    stub = _StubADPExecutor(peer_forward_intent=_ADPForwardIntent.GENERATION, tp_size=2)
+    stub.kv_cache_manager.fp4_mla_context_only_cache = True
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["is_gen"] is False
+    assert stub.add_dummy_calls[0]["token_nums"] == [1]
+    assert stub._adp_dummy_is_gen is False
+
+
 def test_adp_pad_dummy_checks_minimal_context_capacity():
     stub = _StubADPExecutor(
         max_num_tokens=4096,
@@ -3599,9 +3616,10 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_requ
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
 
-def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
-    stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.kda_context_only = True
+@pytest.mark.parametrize("context_only_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+def test_pad_empty_batch_uses_context_dummy_on_context_only_worker(context_only_flag: str):
+    stub, scheduled_batch = _unfittable_rank(tp_size=2)
+    setattr(stub.kv_cache_manager, context_only_flag, True)
     stub.max_total_draft_tokens = 3
 
     _run_pad_empty(stub, scheduled_batch)
@@ -3619,8 +3637,34 @@ def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
     assert stub._pending_adp_dummy_request is dummy
 
 
+@pytest.mark.parametrize("context_only_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+def test_pad_empty_batch_no_op_on_single_rank_context_only_worker(context_only_flag: str):
+    # A tp1 attention-DP context worker (e.g. a Kimi K3 DWDP context server) has no peer
+    # whose forward its empty batch would veto: the iteration skips instead of running a
+    # one-token prefill.
+    stub, scheduled_batch = _unfittable_rank(tp_size=1)
+    setattr(stub.kv_cache_manager, context_only_flag, True)
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+    assert scheduled_batch.batch_size == 0
+    assert stub._pending_adp_dummy_request is None
+
+
+@pytest.mark.parametrize("context_only_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+def test_adp_pad_dummy_no_op_on_single_rank_context_only_worker(context_only_flag: str):
+    stub = _StubADPExecutor(peer_forward_intent=_ADPForwardIntent.CONTEXT, tp_size=1)
+    setattr(stub.kv_cache_manager, context_only_flag, True)
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert stub.active_requests == []
+
+
 def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
-    stub, scheduled_batch = _unfittable_rank()
+    stub, scheduled_batch = _unfittable_rank(tp_size=2)
     stub.kv_cache_manager.kda_context_only = True
     stub.max_total_draft_tokens = 3
     # The dummy role can still say generation when no transceiver drives it.

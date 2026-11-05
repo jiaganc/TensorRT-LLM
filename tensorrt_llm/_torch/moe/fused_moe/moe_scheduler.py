@@ -105,7 +105,15 @@ class MoEScheduler(ABC):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
-    ) -> torch.Tensor: ...
+        moe_output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the MoE layer.
+
+        ``moe_output``: optional ``[num_tokens, hidden_size]`` buffer, in the output dtype, for
+        the backend to write the result into. A scheduler hands it to ``run_moe`` (as
+        ``MoECommPlan.moe_output``) only where the backend output is the layer output; the
+        caller compares the returned tensor with it to see whether it was used.
+        """
 
 
 # ============================================================================
@@ -148,9 +156,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``input_ready_event``: ``x`` is written on another stream. The join
         is deferred to the first kernel that reads ``x`` so routing overlaps it.
+
+        ``moe_output`` (see ``MoEScheduler.forward``) is used by the single-chunk
+        path only.
         """
         moe = self.moe
 
@@ -225,6 +237,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 lora_params=lora_params,
                 routing_aux=routing_aux,
                 input_ready_event=input_ready_event,
+                moe_output=moe_output,
             )
         else:
             input_ready_event = _wait_input_ready(input_ready_event)
@@ -376,6 +389,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         moe = self.moe
         is_first_call = moe.repeat_idx == 0
@@ -397,6 +411,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params,
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
+            moe_output=moe_output,
         )
 
     def _forward_chunk_impl(
@@ -415,6 +430,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         row_offset: Optional[int] = 0,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -471,9 +487,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 and not moe.apply_router_weight_on_input
                 and routing_aux is None
             ):
-                # A fused route+quant reads x.
-                input_ready_event = _wait_input_ready(input_ready_event)
-                fused_result = moe.backend.try_fused_route_quant(x, router_logits)
+                # An accepting backend joins input_ready_event before its launch
+                # reads x. On a decline the join waits until Step 5, so the
+                # routing below (which reads only router_logits) is issued first.
+                fused_result = moe.backend.try_fused_route_quant(
+                    x, router_logits, input_ready_event=input_ready_event
+                )
+                if fused_result is not None:
+                    input_ready_event = None
             else:
                 fused_result = None
 
@@ -675,6 +696,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params,
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             x_ready_event=x_ready_event,
+            moe_output=moe_output,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -1048,6 +1070,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict],
         use_deep_ep_direct_metadata: bool = False,
         x_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -1072,6 +1095,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 output_dtype,
                 do_finalize,
                 use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+                num_tokens=x.shape[0],
+                moe_output=moe_output,
             ),
         )
 
@@ -1081,13 +1106,23 @@ class ExternalCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         do_finalize: bool,
         use_deep_ep_direct_metadata: bool = False,
+        num_tokens: Optional[int] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> MoECommPlan:
         """The comm-layer facts for this forward, derived once for every backend.
 
         Backends read the fields they care about and ignore the rest, so the
         set of facts no longer depends on which class is running.
+
+        ``moe_output`` is the caller's output buffer (see ``MoEScheduler.forward``).
+        Without external communication the finalized backend output is the layer
+        output, so a contiguous buffer of the output's shape (``num_tokens`` rows)
+        and dtype becomes the plan's output buffer when the backend writes into a
+        supplied buffer (``supports_moe_output_in_alltoall_workspace``); otherwise
+        it is ignored.
         """
         moe = self.moe
+        requested_output = moe_output
         # Pre-quant dispatch: SFs arrive swizzled; post-quant dispatch: SFs
         # arrive unswizzled. Backends use this to skip a re-swizzle.
         supports_post_quant = moe.comm is not None and moe.comm.supports_post_quant_dispatch()
@@ -1100,6 +1135,17 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # combine() still reads the flag off the strategy; the plan stays
             # the single place that decides its value.
             moe.comm.payload_in_workspace = payload_in_workspace
+        if (
+            moe_output is None
+            and moe.comm is None
+            and do_finalize
+            and requested_output is not None
+            and requested_output.dtype == output_dtype
+            and tuple(requested_output.shape) == (num_tokens, moe.hidden_size)
+            and requested_output.is_contiguous()
+            and moe.backend.supports_moe_output_in_alltoall_workspace()
+        ):
+            moe_output = requested_output
         recv_expert_count = None
         deep_ep_expert_capacity = None
         if use_deep_ep_direct_metadata:
@@ -1161,6 +1207,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Sequential multi-chunk path for MegaMoE-style backends.
 
@@ -1171,6 +1218,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         kernel for the cross-rank barrier.
         """
         del use_dp_padding  # MegaMoE has no host-side cross-rank shape alignment.
+        del moe_output  # the fused kernels allocate their outputs per chunk
         _wait_input_ready(input_ready_event)
 
         # Fused-comm (MegaMoE) backends cannot carry LoRA adapters; routed-expert
